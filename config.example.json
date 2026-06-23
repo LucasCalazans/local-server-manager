@@ -1,0 +1,26 @@
+{
+  "distro": "Ubuntu",
+  "shell_init": "export NVM_DIR=$HOME/.nvm; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"",
+  "applications": [
+    {
+      "id": "exemplo-meu-site",
+      "name": "Meu Site",
+      "services": [
+        {
+          "id": "exemplo-backend",
+          "name": "Backend",
+          "directory": "/home/usuario/projetos/meu-site/api",
+          "command": "source .venv/bin/activate && python manage.py runserver 0.0.0.0:8000",
+          "url": "http://localhost:8000"
+        },
+        {
+          "id": "exemplo-frontend",
+          "name": "Frontend",
+          "directory": "/home/usuario/projetos/meu-site/web",
+          "command": "npm run dev",
+          "url": "http://localhost:3000"
+        }
+      ]
+    }
+  ]
+}
