@@ -961,6 +961,9 @@ class _FlowLayout(QLayout):
 
     def addItem(self, item) -> None:
         self._items.append(item)
+        # Sem invalidar, nenhum LayoutRequest eh postado e o QScrollArea segue
+        # com a geometria antiga ate um resize externo forcar novo layout.
+        self.invalidate()
 
     def insertItem(self, index: int, item) -> None:
         self._items.insert(index, item)
@@ -976,7 +979,9 @@ class _FlowLayout(QLayout):
 
     def takeAt(self, index: int):
         if 0 <= index < len(self._items):
-            return self._items.pop(index)
+            item = self._items.pop(index)
+            self.invalidate()
+            return item
         return None
 
     def expandingDirections(self):
@@ -1038,8 +1043,16 @@ class _CardsGridContainer(QWidget):
         self.setAcceptDrops(True)
         self.flow = _FlowLayout(self, h_spacing=card_gap, v_spacing=card_gap)
         self.setLayout(self.flow)
-        # Permite que o QScrollArea calcule altura pelo width (= scroll vertical)
-        sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.MinimumExpanding)
+        # Permite que o QScrollArea calcule altura pelo width (= scroll vertical).
+        #
+        # O vertical PRECISA ter ShrinkFlag (Preferred), nunca MinimumExpanding:
+        # QLayout::totalSizeHint calcula a altura do sizeHint como
+        # heightForWidth(sizeHint().width()), e a largura do sizeHint do flow eh
+        # a de UM card — ou seja, a altura de uma coluna unica. Sem ShrinkFlag,
+        # qSmartMinSize adota essa altura como minimo e o QScrollArea passa a
+        # ignorar o heightForWidth(largura real), deixando o container alto
+        # demais: sobra um vazio embaixo e a barra rola pra fora do conteudo.
+        sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         sp.setHeightForWidth(True)
         self.setSizePolicy(sp)
         self._cards: list[QWidget] = []
