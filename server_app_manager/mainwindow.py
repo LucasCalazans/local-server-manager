@@ -23,6 +23,9 @@ def _ulog(msg: str) -> None:
     except Exception:
         pass
 
+import html as _html
+import re
+
 import qtawesome as qta
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QProcess, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
@@ -70,12 +73,13 @@ from .process import (
     ProcessManager,
     build_status_script,
     build_tail_argv_windows,
-    build_tail_script,
+    build_unified_tail_script,
     probe_health_command,
     probe_url,
     running_ids_windows,
     win_logfile,
     wsl_argv,
+    wsl_logfile,
     wsl_stdin_payload,
 )
 from .updater import (
@@ -224,9 +228,6 @@ QSplitter::handle {{
 QSplitter::handle:horizontal {{
     width: 4px;
 }}
-QSplitter::handle:vertical {{
-    height: 4px;
-}}
 QScrollBar:vertical {{
     background: {BG_APP};
     width: 10px;
@@ -282,7 +283,7 @@ ICON_RESTART = "fa5s.sync-alt"
 ICON_PLAY_ALL = "fa5s.forward"
 ICON_STOP_ALL = "fa5s.times-circle"
 ICON_OPEN = "fa5s.external-link-alt"
-ICON_LOG = "fa5s.file-alt"
+ICON_CLOSE = "fa5s.times"
 ICON_EDIT = "fa5s.pen"
 ICON_DELETE = "fa5s.trash"
 
@@ -372,44 +373,70 @@ class SettingsDialog(QDialog):
         self._on_update_requested()
 
 
-class LogPanel(QFrame):
-    """Painel com tail -F do log do servico no WSL, embutido no painel direito."""
+# Cabecalho que o `tail -v` emite ao trocar de arquivo: `==> /caminho <==`.
+_TAIL_HEADER_RE = re.compile(r"^==> (.+) <==$")
+# Sequencias ANSI (cores do vite/uvicorn/etc) — viram lixo num QPlainTextEdit.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
-    def __init__(self, parent, svc, distro: str, on_close):
+# Paleta pros prefixos de origem, distribuida em round-robin pra que servicos
+# vizinhos na lista nunca caiam na mesma cor.
+_LOG_LABEL_COLORS = [
+    "#7ee787", "#79c0ff", "#d2a8ff", "#ffa657",
+    "#f778ba", "#56d4dd", "#e3b341", "#a5d6ff",
+]
+
+# Largura fixa do prefixo, pra que o corpo dos logs fique alinhado em coluna.
+_LABEL_WIDTH = 30
+
+
+class UnifiedLogPanel(QFrame):
+    """Painel lateral com os logs de todos os servicos, prefixados pela origem.
+
+    Os servicos WSL sao seguidos por UM processo so (`tail -v -F` sobre todos
+    os arquivos), que emite `==> arquivo <==` a cada troca de origem — eh dai
+    que sai a atribuicao de cada linha. Servicos com runtime="windows" nao
+    entram nesse tail (o log deles fica no %TEMP% do Windows), entao cada um
+    ganha seu proprio processo de tail via PowerShell.
+    """
+
+    BACKLOG_LINES = 30
+    MAX_BLOCKS = 8000
+    # Acumula linhas e escreve em lote: appendHtml por linha trava a UI quando
+    # um servico despeja centenas de linhas de uma vez (build, stack trace).
+    FLUSH_MS = 120
+
+    def __init__(self, parent, config: Config, on_close):
         super().__init__(parent)
-        self.svc_id = svc.id
-        self._on_close = on_close
         self.setObjectName("logPanel")
         self.setFrameShape(QFrame.StyledPanel)
+        self._on_close = on_close
 
         self.view = QPlainTextEdit()
         self.view.setObjectName("logView")
         self.view.setReadOnly(True)
+        self.view.setMaximumBlockCount(self.MAX_BLOCKS)
+        self.view.setLineWrapMode(QPlainTextEdit.NoWrap)
         mono = QFont("Cascadia Mono", 10)
         mono.setStyleHint(QFont.Monospace)
         self.view.setFont(mono)
 
+        self.count_lbl = QLabel()
+        self.count_lbl.setObjectName("muted")
+        self.count_lbl.setStyleSheet(f"color: {TEXT_MUTED};")
+
+        title = QLabel("Logs")
+        title.setStyleSheet("font-weight: 600;")
+        clear_btn = QPushButton("Limpar")
+        clear_btn.clicked.connect(self.view.clear)
+        # Botao de icone em vez de um "x" em texto: o padding de 12px do QSS
+        # global nao deixa espaco pro caractere num botao estreito.
+        close_btn = _icon_button(ICON_CLOSE, "Fechar painel de logs", width=30)
+        close_btn.clicked.connect(lambda: self._on_close())
+
         header = QHBoxLayout()
         header.setSpacing(8)
-        title = QLabel(svc.name)
-        title.setStyleSheet("font-weight: 600;")
-        is_windows = getattr(svc, "runtime", "wsl") == "windows"
-        log_path_text = (
-            win_logfile(svc.id) if is_windows else f"/tmp/appmgr-{svc.id}.log"
-        )
-        path_lbl = QLabel(f"  {log_path_text}")
-        path_lbl.setObjectName("muted")
-        path_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
-
-        clear_btn = QPushButton("Limpar")
-        close_btn = QPushButton("x")
-        close_btn.setFixedWidth(28)
-        close_btn.setToolTip("Fechar log")
-        clear_btn.clicked.connect(self.view.clear)
-        close_btn.clicked.connect(self._handle_close)
-
         header.addWidget(title)
-        header.addWidget(path_lbl)
+        header.addWidget(self.count_lbl)
         header.addStretch()
         header.addWidget(clear_btn)
         header.addWidget(close_btn)
@@ -420,35 +447,171 @@ class LogPanel(QFrame):
         layout.addLayout(header)
         layout.addWidget(self.view)
 
-        self.proc = QProcess(self)
-        self.proc.setProcessChannelMode(QProcess.MergedChannels)
-        self.proc.readyReadStandardOutput.connect(self._on_output)
-        if is_windows:
-            # Tail nativo via PowerShell Get-Content -Wait
+        # logpath -> (rotulo ja formatado, cor)
+        self._sources: dict[str, tuple[str, str]] = {}
+        self._procs: list[QProcess] = []
+        # Buffers de linha parcial: o tail entrega chunks que cortam linhas ao meio.
+        self._partial: dict[QProcess, str] = {}
+        # De qual arquivo veio a ultima linha do tail unificado (WSL).
+        self._current_src: str = ""
+        # Linhas em branco seguradas ate saber se sao conteudo ou separador
+        # de secao do tail (ver _on_wsl_output).
+        self._blank_held: int = 0
+        self._pending: list[str] = []
+
+        self._flush_timer = QTimer(self)
+        self._flush_timer.timeout.connect(self._flush)
+        self._flush_timer.start(self.FLUSH_MS)
+
+        self.reload_sources(config)
+
+    # ----- ciclo de vida dos tails --------------------------------------
+    def reload_sources(self, config: Config) -> None:
+        """(Re)inicia os tails conforme a config atual."""
+        self.stop_all()
+        self._sources.clear()
+        self._current_src = ""
+
+        wsl_ids: list[str] = []
+        win_svcs: list = []
+        idx = 0
+        for app in config.applications:
+            for svc in app.services:
+                # Servico de producao nao roda localmente — nao tem log.
+                if getattr(svc, "is_prod", False):
+                    continue
+                color = _LOG_LABEL_COLORS[idx % len(_LOG_LABEL_COLORS)]
+                idx += 1
+                label = self._format_label(app.name, svc.name)
+                if getattr(svc, "runtime", "wsl") == "windows":
+                    self._sources[win_logfile(svc.id)] = (label, color)
+                    win_svcs.append(svc)
+                else:
+                    self._sources[wsl_logfile(svc.id)] = (label, color)
+                    wsl_ids.append(svc.id)
+
+        n = len(self._sources)
+        self.count_lbl.setText(
+            f"  ·  {n} servico" + ("s" if n != 1 else "")
+        )
+
+        if wsl_ids:
+            script = build_unified_tail_script(wsl_ids, self.BACKLOG_LINES)
+            proc = self._new_proc(self._on_wsl_output)
+            argv = wsl_argv(config.distro)
+            proc.start(argv[0], argv[1:])
+            proc.waitForStarted(2000)
+            proc.write(wsl_stdin_payload(script).encode("utf-8"))
+            proc.closeWriteChannel()
+
+        # Cada servico Windows precisa do proprio tail (PowerShell nao segue
+        # varios arquivos ao mesmo tempo de forma confiavel).
+        for svc in win_svcs:
+            path = win_logfile(svc.id)
+            proc = self._new_proc(
+                lambda p=None, src=path: self._on_win_output(src)
+            )
             argv = build_tail_argv_windows(svc.id)
-            self.proc.start(argv[0], argv[1:])
-        else:
-            # Tail via WSL bash (mesma mecanica do stdin payload)
-            argv = wsl_argv(distro)
-            self.proc.start(argv[0], argv[1:])
-            self.proc.waitForStarted(2000)
-            self.proc.write(wsl_stdin_payload(build_tail_script(svc.id)).encode("utf-8"))
-            self.proc.closeWriteChannel()
+            proc.start(argv[0], argv[1:])
 
-    def _on_output(self) -> None:
-        chunk = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
-        self.view.moveCursor(QTextCursor.End)
-        self.view.insertPlainText(chunk)
-        self.view.moveCursor(QTextCursor.End)
+        if not self._sources:
+            self.view.setPlainText("Nenhum servico local cadastrado.")
 
-    def _handle_close(self) -> None:
-        self.stop_tail()
-        self._on_close(self.svc_id)
+        # closeEvent para o timer; reabrir a janela cai aqui e o religa.
+        self._flush_timer.start(self.FLUSH_MS)
 
-    def stop_tail(self) -> None:
-        if self.proc.state() != QProcess.NotRunning:
-            self.proc.kill()
-            self.proc.waitForFinished(1000)
+    def _new_proc(self, on_ready) -> QProcess:
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(on_ready)
+        self._procs.append(proc)
+        self._partial[proc] = ""
+        return proc
+
+    def stop_all(self) -> None:
+        for proc in self._procs:
+            if proc.state() != QProcess.NotRunning:
+                proc.kill()
+                proc.waitForFinished(1000)
+            proc.deleteLater()
+        self._procs.clear()
+        self._partial.clear()
+
+    # ----- leitura e formatacao -----------------------------------------
+    @staticmethod
+    def _format_label(app_name: str, svc_name: str) -> str:
+        label = f"{app_name} · {svc_name}"
+        if len(label) > _LABEL_WIDTH:
+            label = label[: _LABEL_WIDTH - 1] + "…"
+        return label.ljust(_LABEL_WIDTH)
+
+    def _read_lines(self, proc: QProcess) -> list[str]:
+        """Le o que chegou e devolve linhas completas, guardando o resto."""
+        chunk = bytes(proc.readAllStandardOutput()).decode("utf-8", "replace")
+        data = self._partial.get(proc, "") + chunk.replace("\r\n", "\n")
+        lines = data.split("\n")
+        self._partial[proc] = lines.pop()  # ultimo pedaco pode estar incompleto
+        return lines
+
+    def _on_wsl_output(self) -> None:
+        proc = self.sender()
+        if not isinstance(proc, QProcess):
+            return
+        for line in self._read_lines(proc):
+            header = _TAIL_HEADER_RE.match(line.strip())
+            if header:
+                # Troca de arquivo: passa a atribuir as proximas linhas a ele.
+                # A linha em branco que veio antes eh o separador de secao do
+                # proprio tail, nao conteudo do log — descarta.
+                self._blank_held = 0
+                self._current_src = header.group(1)
+                continue
+            if not line.strip():
+                # Ainda nao da pra saber se eh linha em branco do log ou o
+                # separador antes do proximo cabecalho: segura ate ter certeza.
+                self._blank_held += 1
+                continue
+            for _ in range(self._blank_held):
+                self._queue(self._current_src, "")
+            self._blank_held = 0
+            self._queue(self._current_src, line)
+
+    def _on_win_output(self, src: str) -> None:
+        proc = self.sender()
+        if not isinstance(proc, QProcess):
+            return
+        for line in self._read_lines(proc):
+            self._queue(src, line)
+
+    def _queue(self, src: str, text: str) -> None:
+        label, color = self._sources.get(src, ("?".ljust(_LABEL_WIDTH), TEXT_MUTED))
+        clean = _ANSI_RE.sub("", text)
+        self._pending.append(
+            f'<span style="color:{color}; white-space:pre;">{_html.escape(label)}</span>'
+            f'<span style="color:{BORDER}; white-space:pre;"> │ </span>'
+            f'<span style="white-space:pre;">{_html.escape(clean)}</span>'
+        )
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        bar = self.view.verticalScrollBar()
+        # So gruda no fim se o usuario ja estava no fim — se ele rolou pra
+        # cima pra ler algo, respeita a posicao dele.
+        at_bottom = bar.value() >= bar.maximum() - 4
+        self.view.setUpdatesEnabled(False)
+        for html_line in self._pending:
+            self.view.appendHtml(html_line)
+        self._pending.clear()
+        self.view.setUpdatesEnabled(True)
+        if at_bottom:
+            self.view.moveCursor(QTextCursor.End)
+            bar.setValue(bar.maximum())
+
+    def suspend(self) -> None:
+        """Derruba os tails ao fechar o painel; reabrir recomeca do backlog."""
+        self._flush_timer.stop()
+        self.stop_all()
 
 
 class _ProbeBridge(QObject):
@@ -960,7 +1123,7 @@ _CardsContainer = _CardsGridContainer
 
 
 class MainWindow(QWidget):
-    # Largura inicial da janela quando o primeiro painel de log abre.
+    # Largura da janela quando o painel de logs abre / esta fechado.
     WIDTH_WITH_LOGS = 1380
     WIDTH_NO_LOGS = 920  # cabe 2 colunas de cards confortavelmente
     CARDS_MIN_W = 420    # 1 coluna minima de card
@@ -994,8 +1157,8 @@ class MainWindow(QWidget):
         # service_id -> timestamp em que entrou em "starting"
         self._starting: dict[str, float] = {}
         self._status_proc: QProcess | None = None
-        # service_id -> LogPanel aberto no painel direito
-        self._log_panels: dict[str, LogPanel] = {}
+        # Painel lateral unico de logs (criado sob demanda pelo botao "Logs").
+        self._log_panel: UnifiedLogPanel | None = None
         # Pool pra probes TCP. As tarefas rodam em thread de fundo dedicada
         # (nao bloqueia a UI nem com varios servicos sem responder).
         self._probe_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="probe")
@@ -1083,8 +1246,8 @@ class MainWindow(QWidget):
     # X / Alt+F4 -> SAI de verdade. Pra mandar pra bandeja, minimize.
     def closeEvent(self, event) -> None:
         # Cleanup
-        for panel in list(self._log_panels.values()):
-            panel.stop_tail()
+        if self._log_panel is not None:
+            self._log_panel.suspend()
         self._probe_pool.shutdown(wait=False, cancel_futures=True)
         if self.tray is not None:
             self.tray.hide()
@@ -1110,14 +1273,17 @@ class MainWindow(QWidget):
 
         add_btn = QPushButton("+ Aplicacao")
         _set_role(add_btn, "primary")
+        logs_btn = QPushButton("Logs")
+        logs_btn.setToolTip("Abre/fecha o painel com os logs de todos os servicos")
         reload_btn = QPushButton("Recarregar")
         settings_btn = QPushButton("Configuracoes")
         open_cfg_btn = QPushButton("Abrir config")
         add_btn.clicked.connect(self._add_application)
+        logs_btn.clicked.connect(self._open_logs)
         reload_btn.clicked.connect(self._reload)
         settings_btn.clicked.connect(self._open_settings)
         open_cfg_btn.clicked.connect(self._open_config_file)
-        for b in (add_btn, reload_btn, settings_btn, open_cfg_btn):
+        for b in (add_btn, logs_btn, reload_btn, settings_btn, open_cfg_btn):
             toolbar.addWidget(b)
         root.addLayout(toolbar)
 
@@ -1136,17 +1302,10 @@ class MainWindow(QWidget):
         self.scroll.setWidget(self.cards_container)
         self.main_splitter.addWidget(self.scroll)
 
-        # Painel direito empilha logs verticalmente; redimensionavel pelo user.
-        self.logs_splitter = QSplitter(Qt.Vertical)
-        self.logs_splitter.setMinimumWidth(self.LOGS_MIN_W)
-        self.logs_splitter.setVisible(False)
-        self.main_splitter.addWidget(self.logs_splitter)
-
-        # Cards mantem o tamanho preferido; logs absorvem o espaco extra.
+        # Cards mantem o tamanho preferido; o painel de logs (adicionado sob
+        # demanda em _open_logs) absorve o espaco extra.
         self.main_splitter.setStretchFactor(0, 0)
-        self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setCollapsible(0, False)
-        self.main_splitter.setCollapsible(1, False)
         root.addWidget(self.main_splitter)
 
     def rebuild(self) -> None:
@@ -1358,51 +1517,50 @@ class MainWindow(QWidget):
             )
             h.addWidget(open_btn)
 
-        log_btn = _icon_button(ICON_LOG, "Ver log")
-        log_btn.clicked.connect(lambda _, s=svc: self._open_log(s))
-        h.addWidget(log_btn)
-
         return row
 
-    def _open_log(self, svc) -> None:
-        # Se ja esta aberto, so destaca/foca.
-        existing = self._log_panels.get(svc.id)
-        if existing is not None:
-            existing.view.setFocus()
+    def _open_logs(self) -> None:
+        """Alterna o painel lateral com os logs de todos os servicos."""
+        if self._log_panel is not None and self._log_panel.isVisible():
+            self._close_logs()
             return
 
-        first_panel = not self._log_panels
-        panel = LogPanel(self, svc, self.config.distro, on_close=self._close_log_panel)
-        self._log_panels[svc.id] = panel
-        self.logs_splitter.addWidget(panel)
-
-        if first_panel:
-            self.logs_splitter.setVisible(True)
-            # Alarga a janela para acomodar o painel sem espremer os cards.
-            cur = self.size()
-            target_w = max(cur.width(), self.WIDTH_WITH_LOGS)
-            if cur.width() < target_w:
-                self.resize(target_w, cur.height())
-            self.main_splitter.setSizes(
-                [self.CARDS_MIN_W, max(self.LOGS_MIN_W, target_w - self.CARDS_MIN_W - 8)]
+        if self._log_panel is None:
+            self._log_panel = UnifiedLogPanel(
+                self, self.config, on_close=self._close_logs
             )
+            self._log_panel.setMinimumWidth(self.LOGS_MIN_W)
+            self.main_splitter.addWidget(self._log_panel)
+            self.main_splitter.setStretchFactor(1, 1)
+            self.main_splitter.setCollapsible(1, False)
         else:
-            # Distribui igualmente entre os paineis empilhados.
-            n = len(self._log_panels)
-            self.logs_splitter.setSizes([1] * n)
+            # Fechar o painel derruba os tails; reabrir precisa recomeca-los.
+            self._log_panel.reload_sources(self.config)
+            self._log_panel.setVisible(True)
 
-    def _close_log_panel(self, svc_id: str) -> None:
-        panel = self._log_panels.pop(svc_id, None)
-        if panel is None:
+        # Alarga a janela para acomodar o painel sem espremer os cards.
+        cur = self.size()
+        target_w = max(cur.width(), self.WIDTH_WITH_LOGS)
+        if cur.width() < target_w:
+            self.resize(target_w, cur.height())
+        self.main_splitter.setSizes(
+            [self.CARDS_MIN_W, max(self.LOGS_MIN_W, target_w - self.CARDS_MIN_W - 8)]
+        )
+
+    def _close_logs(self) -> None:
+        if self._log_panel is None:
             return
-        panel.setParent(None)
-        panel.deleteLater()
-        if not self._log_panels:
-            self.logs_splitter.setVisible(False)
-            # Volta a janela ao tamanho compacto.
-            cur = self.size()
-            if cur.width() > self.WIDTH_NO_LOGS:
-                self.resize(self.WIDTH_NO_LOGS, cur.height())
+        self._log_panel.suspend()
+        self._log_panel.setVisible(False)
+        # Volta a janela ao tamanho compacto.
+        cur = self.size()
+        if cur.width() > self.WIDTH_NO_LOGS:
+            self.resize(self.WIDTH_NO_LOGS, cur.height())
+
+    def _refresh_log_panel(self) -> None:
+        """Re-sincroniza os tails quando a lista de servicos muda."""
+        if self._log_panel is not None and self._log_panel.isVisible():
+            self._log_panel.reload_sources(self.config)
 
     # closeEvent esta definido mais acima junto com a logica da tray.
 
@@ -1586,6 +1744,7 @@ class MainWindow(QWidget):
         save_config(self.config)
         self.manager.config = self.config
         self.rebuild()
+        self._refresh_log_panel()
 
     def _add_application(self) -> None:
         dlg = ApplicationDialog(self)
@@ -1612,6 +1771,7 @@ class MainWindow(QWidget):
         self.config = load_config()
         self.manager.config = self.config
         self.rebuild()
+        self._refresh_log_panel()
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self, self.config, on_update_requested=self._open_update)

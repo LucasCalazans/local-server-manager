@@ -10,6 +10,8 @@ precisar abrir o terminal e digitar os comandos de cada projeto.
   (ex.: Backend e Frontend).
 - Botoes por servico: **Iniciar**, **Parar**, **Reiniciar** (para e sobe de
   novo) e **Abrir** (abre a URL no navegador do Windows).
+- Botao **Logs** na barra superior: painel lateral unico com os logs de todos os
+  servicos, identificados por aplicacao/servico.
 - Indicador de **status** (verde = rodando, cinza = parado), atualizado
   automaticamente — inclusive depois de reabrir o painel.
 - Cadastro pela propria interface (botao **+ Aplicacao**) **ou** editando o
@@ -68,5 +70,8 @@ Veja `config.example.json` para o formato. Campos principais:
 ## Observacoes
 
 - Os logs de cada servico ficam em `/tmp/appmgr-<id>.log` dentro do WSL.
+- O botao **Logs** abre um painel lateral unico com a saida de **todos** os servicos ao
+  vivo, cada linha prefixada pela origem (`Aplicacao · Servico`) numa cor
+  propria. Do lado do WSL isso eh um `tail -F` unico sobre todos os arquivos.
 - Fechar o painel **nao** para as aplicacoes; elas continuam rodando no WSL e o
   status eh re-detectado quando voce reabre.

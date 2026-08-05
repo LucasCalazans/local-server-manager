@@ -68,6 +68,11 @@ def _logfile(service_id: str) -> str:
     return f"/tmp/appmgr-{service_id}.log"
 
 
+def wsl_logfile(service_id: str) -> str:
+    """Caminho do log de um servico WSL (visivel pra UI)."""
+    return _logfile(service_id)
+
+
 def wsl_argv(distro: str) -> list[str]:
     """Argv para invocar `bash -l` no WSL. O script vai por STDIN."""
     argv = ["wsl.exe"]
@@ -132,10 +137,19 @@ def build_launch_script(service: Service, shell_init: str) -> str:
     return "\n".join(lines)
 
 
-def build_tail_script(service_id: str) -> str:
-    log = _logfile(service_id)
-    # -F segue rotacoes; -n 500 mostra o backlog ao abrir.
-    return f"touch '{log}'; tail -n 500 -F '{log}'"
+def build_unified_tail_script(service_ids: list[str], backlog: int = 30) -> str:
+    """Segue os logs de varios servicos WSL num unico processo.
+
+    `tail -v` forca o cabecalho `==> <arquivo> <==` sempre — inclusive com um
+    unico arquivo — e o reemite a cada troca de origem enquanto segue. Eh isso
+    que permite a UI saber de qual servico veio cada linha sem precisar de um
+    processo por servico. `-F` segue rotacao/recriacao do arquivo, entao um
+    servico que ainda nem iniciou passa a aparecer sozinho quando subir.
+    """
+    logs = [_logfile(sid) for sid in service_ids]
+    quoted = " ".join(f"'{p}'" for p in logs)
+    # touch garante que todos existam: sem isso o tail reclama dos ausentes.
+    return f"touch {quoted} 2>/dev/null; tail -v -n {backlog} -F {quoted}"
 
 
 def build_stop_script(service: Service, shell_init: str) -> str:
