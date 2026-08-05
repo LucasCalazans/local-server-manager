@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import glob
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -80,6 +81,40 @@ def wsl_argv(distro: str) -> list[str]:
         argv += ["-d", distro]
     argv += ["--", "bash", "-l"]
     return argv
+
+
+# BatchMode evita que um host sem chave trave o app num prompt de senha;
+# ConnectTimeout impede que a maquina remota fora do ar segure o poll.
+SSH_OPTS = "-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+
+# Caracteres aceitos num host/porta que vai pra dentro de um script shell.
+_SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _single_quote(s: str) -> str:
+    """Envolve em aspas simples pro shell, escapando aspas simples internas."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def env_argv(env) -> list[str]:
+    """Argv para abrir o shell de um ambiente.
+
+    Sempre passa pelo WSL local — mesmo para ambientes ssh, onde ele eh so o
+    tunel (ver Environment em config.py).
+    """
+    return wsl_argv(getattr(env, "distro", ""))
+
+
+def env_payload(env, script: str) -> str:
+    """Empacota `script` para rodar no ambiente, seja local ou remoto."""
+    payload = wsl_stdin_payload(script)
+    if getattr(env, "kind", "local") != "ssh":
+        return payload
+    host = (getattr(env, "ssh_host", "") or "").strip()
+    # O payload nao contem aspas simples (eh base64 + aspas duplas), entao
+    # envolve-lo em aspas simples entrega o texto intacto ao shell remoto.
+    remote = f"ssh {SSH_OPTS} -T {host} {_single_quote(payload)}"
+    return wsl_stdin_payload(remote)
 
 
 def wsl_stdin_payload(script: str, keep_file: bool = False) -> str:
@@ -191,17 +226,59 @@ def build_stop_script(service: Service, shell_init: str) -> str:
     return "\n".join(parts)
 
 
-def build_status_script() -> str:
-    # Imprime o id de cada servico cujo pidfile aponta para um processo vivo.
-    return (
+def url_host_port(url: str) -> tuple[str, int] | None:
+    """(host, porta) de uma URL, ou None se nao der pra extrair com seguranca."""
+    if not url:
+        return None
+    try:
+        u = urlparse(url)
+        host = u.hostname or "localhost"
+        port = u.port or (443 if u.scheme == "https" else 80)
+    except Exception:
+        return None
+    # host vai literal pra dentro de um script shell — recusa o que nao for
+    # um nome/IP simples em vez de arriscar injecao.
+    if not _SAFE_HOST_RE.match(host) or not (0 < int(port) < 65536):
+        return None
+    return host, int(port)
+
+
+def build_status_script(
+    probes: list[tuple[str, str, int]] | None = None,
+    health: list[tuple[str, str, str, str]] | None = None,
+) -> str:
+    """Script que reporta, numa unica ida, tudo que esta vivo do outro lado.
+
+    Sai uma linha por deteccao: `PID <id>`, `URL <id>` ou `HEALTH <id>`.
+
+    Os probes de URL e de health_command entram aqui (em vez de rodarem do
+    lado do Windows) quando o ambiente eh remoto: `localhost:8765` de la nao
+    eh o localhost daqui, e resolver tudo na mesma sessao ssh evita um round
+    trip por servico — o que pesaria, ja que a tailnet custa ~210ms cada.
+    """
+    parts = [
+        # Imprime o id de cada servico cujo pidfile aponta pra processo vivo.
         "for f in /tmp/appmgr-*.pid; do "
         '[ -e "$f" ] || continue; '
         'p=$(cat "$f" 2>/dev/null); '
         'if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then '
-        'b=$(basename "$f" .pid); echo "${b#appmgr-}"; '
+        'b=$(basename "$f" .pid); echo "PID ${b#appmgr-}"; '
         "fi; "
         "done"
-    )
+    ]
+    for sid, host, port in probes or []:
+        parts.append(
+            f"timeout 1 bash -c 'exec 3<>/dev/tcp/{host}/{port}' 2>/dev/null "
+            f'&& echo "URL {sid}"'
+        )
+    for sid, directory, init, cmd in health or []:
+        prefix = f"{init.strip()}; " if init.strip() else ""
+        cd = f"cd {_shell_dir(directory)} 2>/dev/null; " if directory else ""
+        parts.append(
+            f"( {cd}{prefix}timeout 3 bash -c {_single_quote(cmd)} ) "
+            f'>/dev/null 2>&1 && echo "HEALTH {sid}"'
+        )
+    return "\n".join(parts)
 
 
 # ============================================================
@@ -431,9 +508,11 @@ def running_ids_windows() -> set[str]:
     return alive
 
 
-def probe_health_command(service: Service, distro: str, shell_init: str,
-                         timeout: float = 2.0) -> bool:
+def probe_health_command(service: Service, env, timeout: float = 2.0) -> bool:
     """Roda o `health_command` do servico e retorna True se exit==0.
+
+    Usado no ambiente local. Em ambiente ssh, os health checks vao dentro do
+    build_status_script pra caber na mesma ida de rede.
 
     Usa o mesmo runtime do servico (WSL ou Windows). Diretorio e shell_init
     sao aplicados pra que o comando tenha o mesmo contexto que o `command`
@@ -442,6 +521,8 @@ def probe_health_command(service: Service, distro: str, shell_init: str,
     cmd = (getattr(service, "health_command", "") or "").strip()
     if not cmd:
         return False
+    distro = getattr(env, "distro", "")
+    shell_init = getattr(env, "shell_init", "")
     try:
         if getattr(service, "runtime", "wsl") == "windows":
             argv, cwd = _wrap_windows_cmd(service.directory, cmd)
@@ -484,18 +565,30 @@ def build_tail_argv_windows(service_id: str) -> list[str]:
     return ["powershell.exe", "-NoProfile", "-Command", cmd]
 
 
+def supports_service(env, service: Service) -> bool:
+    """Se o ambiente consegue subir/parar esse servico.
+
+    Servicos runtime="windows" so rodam no ambiente local: por ssh eles
+    cairiam numa sessao Windows sem desktop (a sessao do sshd), onde um app
+    grafico nao aparece pra ninguem.
+    """
+    if getattr(service, "runtime", "wsl") != "windows":
+        return True
+    return getattr(env, "kind", "local") != "ssh"
+
+
 class ProcessManager:
-    """Dispara, para e consulta servicos no WSL."""
+    """Dispara, para e consulta servicos — no WSL local ou via ssh."""
 
     def __init__(self, config: Config):
         self.config = config
         # service_id -> Popen do relay wsl.exe (enquanto esta sessao o iniciou)
         self._relays: dict[str, subprocess.Popen] = {}
 
-    def _run_blocking(self, script: str, capture: bool = False, timeout: int = 30):
+    def _run_blocking(self, env, script: str, capture: bool = False, timeout: int = 30):
         return subprocess.run(
-            wsl_argv(self.config.distro),
-            input=wsl_stdin_payload(script),
+            env_argv(env),
+            input=env_payload(env, script),
             text=True,
             stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -503,16 +596,18 @@ class ProcessManager:
             timeout=timeout,
         )
 
-    def start(self, service: Service) -> None:
+    def start(self, env, service: Service) -> None:
+        if not supports_service(env, service):
+            return
         if getattr(service, "runtime", "wsl") == "windows":
             proc = start_windows(service)
             if proc is not None:
                 self._relays[service.id] = proc
             return
-        # WSL (default)
-        script = build_launch_script(service, self.config.shell_init)
+        # WSL local ou remoto
+        script = build_launch_script(service, env.shell_init)
         proc = subprocess.Popen(
-            wsl_argv(self.config.distro),
+            env_argv(env),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -520,13 +615,15 @@ class ProcessManager:
             text=True,
         )
         try:
-            proc.stdin.write(wsl_stdin_payload(script))
+            proc.stdin.write(env_payload(env, script))
             proc.stdin.close()
         except Exception:
             pass
         self._relays[service.id] = proc
 
-    def stop(self, service: Service) -> None:
+    def stop(self, env, service: Service) -> None:
+        if not supports_service(env, service):
+            return
         if getattr(service, "runtime", "wsl") == "windows":
             stop_windows(service)
             relay = self._relays.pop(service.id, None)
@@ -536,10 +633,10 @@ class ProcessManager:
                 except Exception:
                     pass
             return
-        # WSL
-        script = build_stop_script(service, self.config.shell_init)
+        # WSL local ou remoto
+        script = build_stop_script(service, env.shell_init)
         try:
-            self._run_blocking(script, timeout=60)
+            self._run_blocking(env, script, timeout=60)
         except subprocess.TimeoutExpired:
             pass
         relay = self._relays.pop(service.id, None)
@@ -549,16 +646,23 @@ class ProcessManager:
             except Exception:
                 pass
 
-    def running_ids(self) -> set[str]:
-        """Consulta sincrona — uniao de pidfiles WSL e Windows."""
-        wsl_alive = set()
+    def running_ids(self, env) -> set[str]:
+        """Consulta sincrona de um ambiente (pidfiles; + PIDs Windows no local)."""
+        alive = set()
         try:
-            out = self._run_blocking(build_status_script(), capture=True, timeout=15).stdout
-            wsl_alive = {line.strip() for line in out.splitlines() if line.strip()}
+            out = self._run_blocking(
+                env, build_status_script(), capture=True, timeout=20
+            ).stdout
+            alive = {
+                line.split(None, 1)[1].strip()
+                for line in out.splitlines()
+                if line.startswith("PID ")
+            }
         except Exception:
             pass
-        try:
-            win_alive = running_ids_windows()
-        except Exception:
-            win_alive = set()
-        return wsl_alive | win_alive
+        if getattr(env, "kind", "local") != "ssh":
+            try:
+                alive |= running_ids_windows()
+            except Exception:
+                pass
+        return alive

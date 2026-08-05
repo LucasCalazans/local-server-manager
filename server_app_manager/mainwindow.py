@@ -25,6 +25,7 @@ def _ulog(msg: str) -> None:
 
 import html as _html
 import re
+from urllib.parse import urlparse, urlunparse
 
 import qtawesome as qta
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QProcess, QRect, QSize, Qt, QTimer, QUrl, Signal
@@ -63,20 +64,25 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyle,
     QSystemTrayIcon,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .config import CONFIG_PATH, Application, Config, load_config, save_config
-from .dialogs import ApplicationDialog
+from .dialogs import ApplicationDialog, EnvironmentDialog
 from .process import (
     ProcessManager,
     build_status_script,
+    env_argv,
+    env_payload,
     build_tail_argv_windows,
     build_unified_tail_script,
     probe_health_command,
     probe_url,
     running_ids_windows,
+    supports_service,
+    url_host_port,
     win_logfile,
     wsl_argv,
     wsl_logfile,
@@ -262,6 +268,19 @@ _DOT_LABEL = {
 }
 
 
+def _skey(env_id: str, service_id: str) -> str:
+    """Chave de UI de um servico.
+
+    O id de servico sozinho nao serve como chave global: a mesma aplicacao
+    copiada entre maquinas carrega o mesmo id nas duas configs (acontece hoje
+    com Sonda/event_type e Sonda/Downloads Report). Nos discos nao ha conflito
+    — sao /tmp de maquinas diferentes —, entao a saida eh qualificar a chave
+    com o ambiente aqui, em vez de regerar ids e perder a interoperacao com o
+    gerenciador que roda na outra ponta.
+    """
+    return f"{env_id}:{service_id}"
+
+
 def _dot_style(state: str) -> str:
     color = _DOT_COLORS[state]
     # font-size grande pro ponto ficar bem visivel;
@@ -322,16 +341,29 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(540)
         self._on_update_requested = on_update_requested
 
-        self.distro_edit = QLineEdit(config.distro)
-        self.distro_edit.setPlaceholderText("Ex.: Ubuntu (vazio = distro padrao)")
-        self.init_edit = QLineEdit(config.shell_init)
-        self.init_edit.setPlaceholderText(
-            'export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
-        )
+        self.config = config
 
-        form = QFormLayout()
-        form.addRow("Distro WSL:", self.distro_edit)
-        form.addRow("Shell init:", self.init_edit)
+        # ----- ambientes (cada um vira uma aba na janela principal) -------
+        env_label = QLabel("Ambientes")
+        env_label.setStyleSheet("font-weight: 600;")
+        self.env_list = QListWidget()
+        self.env_list.setMaximumHeight(130)
+        self.env_list.itemDoubleClicked.connect(lambda _: self._edit_env())
+
+        add_env = QPushButton("Adicionar")
+        edit_env = QPushButton("Editar")
+        del_env = QPushButton("Remover")
+        _set_role(del_env, "danger")
+        add_env.clicked.connect(self._add_env)
+        edit_env.clicked.connect(self._edit_env)
+        del_env.clicked.connect(self._del_env)
+
+        env_btns = QHBoxLayout()
+        env_btns.setSpacing(6)
+        env_btns.addWidget(add_env)
+        env_btns.addWidget(edit_env)
+        env_btns.addWidget(del_env)
+        env_btns.addStretch()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -345,10 +377,13 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(14)
-        layout.addLayout(form)
+        layout.addWidget(env_label)
+        layout.addWidget(self.env_list)
+        layout.addLayout(env_btns)
         hint = QLabel(
-            "Shell init eh prependido a cada comando. Util quando o npm vem do "
-            "nvm e o ~/.bashrc nao carrega em shell nao-interativo."
+            "Cada ambiente eh uma aba. Um ambiente ssh executa os comandos na "
+            "maquina remota, saindo pelo WSL local (que eh quem tem a config "
+            "de ssh e a rota da tailnet)."
         )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
@@ -366,6 +401,59 @@ class SettingsDialog(QDialog):
 
         layout.addStretch()
         layout.addWidget(buttons)
+        self._refresh_envs()
+
+    # ----- CRUD de ambientes ---------------------------------------------
+    def _refresh_envs(self) -> None:
+        self.env_list.clear()
+        for env in self.config.environments:
+            n = sum(len(a.services) for a in env.applications)
+            where = f"ssh {env.ssh_host}" if env.is_ssh else "WSL local"
+            self.env_list.addItem(
+                QListWidgetItem(f"{env.name}   ·   {where}   ·   {n} servicos")
+            )
+
+    def _selected_env_index(self) -> int:
+        return self.env_list.currentRow()
+
+    def _add_env(self) -> None:
+        dlg = EnvironmentDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            self.config.environments.append(dlg.result_environment())
+            self._refresh_envs()
+
+    def _edit_env(self) -> None:
+        i = self._selected_env_index()
+        if i < 0:
+            return
+        env = self.config.environments[i]
+        dlg = EnvironmentDialog(self, env)
+        if dlg.exec() == QDialog.Accepted:
+            updated = dlg.result_environment()
+            # Preserva as aplicacoes: o dialogo so edita os dados da maquina.
+            updated.applications = env.applications
+            self.config.environments[i] = updated
+            self._refresh_envs()
+
+    def _del_env(self) -> None:
+        i = self._selected_env_index()
+        if i < 0:
+            return
+        if len(self.config.environments) == 1:
+            QMessageBox.warning(
+                self, "Ultimo ambiente",
+                "Pelo menos um ambiente precisa existir.",
+            )
+            return
+        env = self.config.environments[i]
+        n = sum(len(a.services) for a in env.applications)
+        resp = QMessageBox.question(
+            self, "Remover ambiente",
+            f"Remover \"{env.name}\" e as {n} aplicacoes/servicos cadastrados nele?",
+        )
+        if resp == QMessageBox.Yes:
+            del self.config.environments[i]
+            self._refresh_envs()
 
     def _handle_update_clicked(self) -> None:
         # Fecha o Settings primeiro pra abrir o Update por cima limpo
@@ -386,7 +474,8 @@ _LOG_LABEL_COLORS = [
 ]
 
 # Largura fixa do prefixo, pra que o corpo dos logs fique alinhado em coluna.
-_LABEL_WIDTH = 30
+# Cabe "<ambiente>/<app> · <servico>" quando o ambiente eh remoto.
+_LABEL_WIDTH = 36
 
 
 class UnifiedLogPanel(QFrame):
@@ -447,13 +536,16 @@ class UnifiedLogPanel(QFrame):
         layout.addLayout(header)
         layout.addWidget(self.view)
 
-        # logpath -> (rotulo ja formatado, cor)
-        self._sources: dict[str, tuple[str, str]] = {}
+        # (env.id, logpath) -> (rotulo ja formatado, cor). A chave leva o
+        # ambiente porque o mesmo caminho /tmp existe nas duas maquinas.
+        self._sources: dict[tuple[str, str], tuple[str, str]] = {}
         self._procs: list[QProcess] = []
+        # QProcess -> env.id, pra atribuir a saida ao ambiente certo
+        self._proc_env: dict[QProcess, str] = {}
         # Buffers de linha parcial: o tail entrega chunks que cortam linhas ao meio.
         self._partial: dict[QProcess, str] = {}
-        # De qual arquivo veio a ultima linha do tail unificado (WSL).
-        self._current_src: str = ""
+        # env_id -> de qual arquivo veio a ultima linha daquele tail.
+        self._current_src: dict[str, str] = {}
         # Linhas em branco seguradas ate saber se sao conteudo ou separador
         # de secao do tail (ver _on_wsl_output).
         self._blank_held: int = 0
@@ -467,52 +559,58 @@ class UnifiedLogPanel(QFrame):
 
     # ----- ciclo de vida dos tails --------------------------------------
     def reload_sources(self, config: Config) -> None:
-        """(Re)inicia os tails conforme a config atual."""
+        """(Re)inicia os tails conforme a config atual, um por ambiente."""
         self.stop_all()
         self._sources.clear()
-        self._current_src = ""
+        self._current_src.clear()
 
-        wsl_ids: list[str] = []
-        win_svcs: list = []
         idx = 0
-        for app in config.applications:
-            for svc in app.services:
-                # Servico de producao nao roda localmente — nao tem log.
-                if getattr(svc, "is_prod", False):
-                    continue
-                color = _LOG_LABEL_COLORS[idx % len(_LOG_LABEL_COLORS)]
-                idx += 1
-                label = self._format_label(app.name, svc.name)
-                if getattr(svc, "runtime", "wsl") == "windows":
-                    self._sources[win_logfile(svc.id)] = (label, color)
-                    win_svcs.append(svc)
-                else:
-                    self._sources[wsl_logfile(svc.id)] = (label, color)
-                    wsl_ids.append(svc.id)
+        for env in config.environments:
+            wsl_ids: list[str] = []
+            win_svcs: list = []
+            for app in env.applications:
+                for svc in app.services:
+                    # Servico de producao nao roda localmente — nao tem log.
+                    if getattr(svc, "is_prod", False):
+                        continue
+                    color = _LOG_LABEL_COLORS[idx % len(_LOG_LABEL_COLORS)]
+                    idx += 1
+                    label = self._format_label(env, app.name, svc.name)
+                    if getattr(svc, "runtime", "wsl") == "windows":
+                        if env.is_ssh:
+                            # O log dele fica no %TEMP% do Windows de la, fora
+                            # do alcance do ssh (que entra no WSL remoto).
+                            continue
+                        self._sources[(env.id, win_logfile(svc.id))] = (label, color)
+                        win_svcs.append(svc)
+                    else:
+                        self._sources[(env.id, wsl_logfile(svc.id))] = (label, color)
+                        wsl_ids.append(svc.id)
+
+            if wsl_ids:
+                script = build_unified_tail_script(wsl_ids, self.BACKLOG_LINES)
+                proc = self._new_proc(self._on_wsl_output, env.id)
+                argv = env_argv(env)
+                proc.start(argv[0], argv[1:])
+                proc.waitForStarted(2000)
+                proc.write(env_payload(env, script).encode("utf-8"))
+                proc.closeWriteChannel()
+
+            # Cada servico Windows precisa do proprio tail (PowerShell nao segue
+            # varios arquivos ao mesmo tempo de forma confiavel).
+            for svc in win_svcs:
+                path = win_logfile(svc.id)
+                proc = self._new_proc(
+                    lambda p=None, src=path, eid=env.id: self._on_win_output(eid, src),
+                    env.id,
+                )
+                argv = build_tail_argv_windows(svc.id)
+                proc.start(argv[0], argv[1:])
 
         n = len(self._sources)
         self.count_lbl.setText(
             f"  ·  {n} servico" + ("s" if n != 1 else "")
         )
-
-        if wsl_ids:
-            script = build_unified_tail_script(wsl_ids, self.BACKLOG_LINES)
-            proc = self._new_proc(self._on_wsl_output)
-            argv = wsl_argv(config.distro)
-            proc.start(argv[0], argv[1:])
-            proc.waitForStarted(2000)
-            proc.write(wsl_stdin_payload(script).encode("utf-8"))
-            proc.closeWriteChannel()
-
-        # Cada servico Windows precisa do proprio tail (PowerShell nao segue
-        # varios arquivos ao mesmo tempo de forma confiavel).
-        for svc in win_svcs:
-            path = win_logfile(svc.id)
-            proc = self._new_proc(
-                lambda p=None, src=path: self._on_win_output(src)
-            )
-            argv = build_tail_argv_windows(svc.id)
-            proc.start(argv[0], argv[1:])
 
         if not self._sources:
             self.view.setPlainText("Nenhum servico local cadastrado.")
@@ -520,12 +618,13 @@ class UnifiedLogPanel(QFrame):
         # closeEvent para o timer; reabrir a janela cai aqui e o religa.
         self._flush_timer.start(self.FLUSH_MS)
 
-    def _new_proc(self, on_ready) -> QProcess:
+    def _new_proc(self, on_ready, env_id: str) -> QProcess:
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.MergedChannels)
         proc.readyReadStandardOutput.connect(on_ready)
         self._procs.append(proc)
         self._partial[proc] = ""
+        self._proc_env[proc] = env_id
         return proc
 
     def stop_all(self) -> None:
@@ -536,11 +635,15 @@ class UnifiedLogPanel(QFrame):
             proc.deleteLater()
         self._procs.clear()
         self._partial.clear()
+        self._proc_env.clear()
 
     # ----- leitura e formatacao -----------------------------------------
     @staticmethod
-    def _format_label(app_name: str, svc_name: str) -> str:
-        label = f"{app_name} · {svc_name}"
+    def _format_label(env, app_name: str, svc_name: str) -> str:
+        # Prefixo do ambiente so quando ele nao eh o local, pra nao
+        # gastar a largura da coluna com o caso mais comum.
+        prefix = f"{env.name}/" if env.is_ssh else ""
+        label = f"{prefix}{app_name} · {svc_name}"
         if len(label) > _LABEL_WIDTH:
             label = label[: _LABEL_WIDTH - 1] + "…"
         return label.ljust(_LABEL_WIDTH)
@@ -557,6 +660,7 @@ class UnifiedLogPanel(QFrame):
         proc = self.sender()
         if not isinstance(proc, QProcess):
             return
+        env_id = self._proc_env.get(proc, "")
         for line in self._read_lines(proc):
             header = _TAIL_HEADER_RE.match(line.strip())
             if header:
@@ -564,27 +668,30 @@ class UnifiedLogPanel(QFrame):
                 # A linha em branco que veio antes eh o separador de secao do
                 # proprio tail, nao conteudo do log — descarta.
                 self._blank_held = 0
-                self._current_src = header.group(1)
+                self._current_src[env_id] = header.group(1)
                 continue
+            src = self._current_src.get(env_id, "")
             if not line.strip():
                 # Ainda nao da pra saber se eh linha em branco do log ou o
                 # separador antes do proximo cabecalho: segura ate ter certeza.
                 self._blank_held += 1
                 continue
             for _ in range(self._blank_held):
-                self._queue(self._current_src, "")
+                self._queue(env_id, src, "")
             self._blank_held = 0
-            self._queue(self._current_src, line)
+            self._queue(env_id, src, line)
 
-    def _on_win_output(self, src: str) -> None:
+    def _on_win_output(self, env_id: str, src: str) -> None:
         proc = self.sender()
         if not isinstance(proc, QProcess):
             return
         for line in self._read_lines(proc):
-            self._queue(src, line)
+            self._queue(env_id, src, line)
 
-    def _queue(self, src: str, text: str) -> None:
-        label, color = self._sources.get(src, ("?".ljust(_LABEL_WIDTH), TEXT_MUTED))
+    def _queue(self, env_id: str, src: str, text: str) -> None:
+        label, color = self._sources.get(
+            (env_id, src), ("?".ljust(_LABEL_WIDTH), TEXT_MUTED)
+        )
         clean = _ANSI_RE.sub("", text)
         self._pending.append(
             f'<span style="color:{color}; white-space:pre;">{_html.escape(label)}</span>'
@@ -1164,12 +1271,19 @@ class MainWindow(QWidget):
         self._start_all_btns: dict[str, QPushButton] = {}
         self._stop_all_btns: dict[str, QPushButton] = {}
         # app.id -> Application (pra _apply_status saber qual estado tem)
-        self._apps_by_id: dict[str, Application] = {}
+        # (env.id, app.id) -> (Environment, Application), pros botoes de lote
+        self._apps_by_id: dict[str, tuple] = {}
+        # env.id -> pagina de cards da aba
+        self._env_scrolls: dict[str, QScrollArea] = {}
+        self._env_containers: dict[str, _CardsGridContainer] = {}
         self._running: set[str] = set()
-        self._running_by_pid: set[str] = set()
+        # Por ambiente: vivos por pidfile e vivos por probe (URL/health remoto)
+        self._running_by_pid_env: dict[str, set[str]] = {}
+        self._running_by_url_env: dict[str, set[str]] = {}
         # service_id -> timestamp em que entrou em "starting"
         self._starting: dict[str, float] = {}
-        self._status_proc: QProcess | None = None
+        # env.id -> QProcess do poll de status em voo naquele ambiente
+        self._status_procs: dict[str, QProcess] = {}
         # Painel lateral unico de logs (criado sob demanda pelo botao "Logs").
         self._log_panel: UnifiedLogPanel | None = None
         # Pool pra probes TCP. As tarefas rodam em thread de fundo dedicada
@@ -1179,6 +1293,7 @@ class MainWindow(QWidget):
         self._probe_in_flight = False
         self._probe_bridge = _ProbeBridge()
         self._probe_bridge.result_ready.connect(self._on_url_probe_done)
+        self._running_by_url_local: set[str] = set()
 
         self._build_ui()
         self._setup_tray()
@@ -1261,6 +1376,11 @@ class MainWindow(QWidget):
         # Cleanup
         if self._log_panel is not None:
             self._log_panel.suspend()
+        self._timer.stop()
+        for proc in list(self._status_procs.values()):
+            if proc is not None and proc.state() != QProcess.NotRunning:
+                proc.kill()
+        self._status_procs.clear()
         self._probe_pool.shutdown(wait=False, cancel_futures=True)
         if self.tray is not None:
             self.tray.hide()
@@ -1300,20 +1420,13 @@ class MainWindow(QWidget):
             toolbar.addWidget(b)
         root.addLayout(toolbar)
 
-        # Splitter horizontal: cards a esquerda, painel de logs a direita.
+        # Splitter horizontal: abas de ambiente a esquerda, logs a direita.
         self.main_splitter = QSplitter(Qt.Horizontal)
 
-        # ScrollArea + grid de cards (responsivo, drag-drop nativo).
-        self.cards_container = _CardsGridContainer(self.CARD_WIDTH)
-        self.cards_container.cards_reordered.connect(self._on_apps_reordered)
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-        self.scroll.setMinimumWidth(self.CARDS_MIN_W)
-        # Sem scroll horizontal — colunas adaptam pelo width disponivel.
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.setWidget(self.cards_container)
-        self.main_splitter.addWidget(self.scroll)
+        # Uma aba por ambiente; cada uma com seu proprio grid de cards.
+        self.tabs = QTabWidget()
+        self.tabs.setMinimumWidth(self.CARDS_MIN_W)
+        self.main_splitter.addWidget(self.tabs)
 
         # Cards mantem o tamanho preferido; o painel de logs (adicionado sob
         # demanda em _open_logs) absorve o espaco extra.
@@ -1321,9 +1434,67 @@ class MainWindow(QWidget):
         self.main_splitter.setCollapsible(0, False)
         root.addWidget(self.main_splitter)
 
+    def _current_env(self):
+        """Ambiente da aba ativa (o primeiro, se algo sair do lugar)."""
+        idx = self.tabs.currentIndex() if hasattr(self, "tabs") else 0
+        envs = self.config.environments
+        if 0 <= idx < len(envs):
+            return envs[idx]
+        return envs[0] if envs else None
+
+    def _sync_tabs(self) -> None:
+        """Garante uma aba por ambiente, preservando as paginas existentes.
+
+        Recriar as abas a cada rebuild custaria a posicao do scroll e piscaria
+        a tela — e o rebuild roda a cada mudanca de estado de servico.
+        """
+        want = [e.id for e in self.config.environments]
+        have = [self.tabs.widget(i).property("env_id") for i in range(self.tabs.count())]
+        if want == have:
+            for i, env in enumerate(self.config.environments):
+                self.tabs.setTabText(i, self._tab_label(env))
+            return
+
+        keep = dict(self._env_scrolls)
+        while self.tabs.count():
+            self.tabs.removeTab(0)
+        self._env_scrolls.clear()
+        self._env_containers.clear()
+
+        for env in self.config.environments:
+            scroll = keep.get(env.id)
+            if scroll is None:
+                container = _CardsGridContainer(self.CARD_WIDTH)
+                container.cards_reordered.connect(
+                    lambda eid=env.id: self._on_apps_reordered(eid)
+                )
+                scroll = QScrollArea()
+                scroll.setProperty("env_id", env.id)
+                scroll.setWidgetResizable(True)
+                scroll.setFrameShape(QFrame.NoFrame)
+                # Sem scroll horizontal — colunas adaptam pelo width disponivel.
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                scroll.setWidget(container)
+            self._env_scrolls[env.id] = scroll
+            self._env_containers[env.id] = scroll.widget()
+            self.tabs.addTab(scroll, self._tab_label(env))
+            if env.is_ssh:
+                self.tabs.setTabToolTip(
+                    self.tabs.count() - 1,
+                    f"Comandos vao por ssh {env.ssh_host} (saindo do WSL local)",
+                )
+
+    @staticmethod
+    def _tab_label(env) -> str:
+        n = sum(len(a.services) for a in env.applications)
+        return f"{env.name}  ({n})"
+
     def rebuild(self) -> None:
-        """Recria os cards a partir da config atual."""
-        scroll_y = self.scroll.verticalScrollBar().value() if hasattr(self, "scroll") else 0
+        """Recria os cards de todas as abas a partir da config atual."""
+        self._sync_tabs()
+        scroll_pos = {
+            eid: sc.verticalScrollBar().value() for eid, sc in self._env_scrolls.items()
+        }
 
         self._dots.clear()
         self._names.clear()
@@ -1333,49 +1504,63 @@ class MainWindow(QWidget):
         self._start_all_btns.clear()
         self._stop_all_btns.clear()
         self._apps_by_id.clear()
-        self.cards_container.clear_cards()
 
-        if not self.config.applications:
-            empty = QLabel(
-                "Nenhuma aplicacao cadastrada.\n\n"
-                "Clique em \"+ Aplicacao\" para cadastrar seu primeiro projeto."
-            )
-            empty.setObjectName("muted")
-            empty.setAlignment(Qt.AlignCenter)
-            empty.setWordWrap(True)
-            empty.setStyleSheet(f"color: {TEXT_MUTED}; padding: 60px; font-size: 14px;")
-            self.cards_container.add_card(empty)
-            return
+        for env in self.config.environments:
+            container = self._env_containers.get(env.id)
+            if container is None:
+                continue
+            container.clear_cards()
+            if not env.applications:
+                container.add_card(self._empty_label(env))
+                continue
+            for app in env.applications:
+                container.add_card(self._build_card(env, app))
 
-        for app in self.config.applications:
-            self.cards_container.add_card(self._build_card(app))
         self._apply_status()
-        if scroll_y:
-            QTimer.singleShot(0, lambda y=scroll_y: self.scroll.verticalScrollBar().setValue(y))
+        for eid, y in scroll_pos.items():
+            if y:
+                sc = self._env_scrolls.get(eid)
+                if sc is not None:
+                    QTimer.singleShot(0, lambda s=sc, v=y: s.verticalScrollBar().setValue(v))
 
-    def _on_apps_reordered(self) -> None:
-        """Salva nova ordem das aplicacoes apos drag-drop."""
-        apps_by_id = {a.id: a for a in self.config.applications}
+    def _empty_label(self, env) -> QLabel:
+        empty = QLabel(
+            f"Nenhuma aplicacao cadastrada em \"{env.name}\".\n\n"
+            "Clique em \"+ Aplicacao\" para cadastrar seu primeiro projeto."
+        )
+        empty.setObjectName("muted")
+        empty.setAlignment(Qt.AlignCenter)
+        empty.setWordWrap(True)
+        empty.setStyleSheet(f"color: {TEXT_MUTED}; padding: 60px; font-size: 14px;")
+        return empty
+
+    def _on_apps_reordered(self, env_id: str) -> None:
+        """Salva nova ordem das aplicacoes de um ambiente apos drag-drop."""
+        env = self.config.env_by_id(env_id)
+        container = self._env_containers.get(env_id)
+        if env is None or container is None:
+            return
+        apps_by_id = {a.id: a for a in env.applications}
         new_order = []
-        for c in self.cards_container.cards():
+        for c in container.cards():
             if isinstance(c, _AppCard) and c.app_id in apps_by_id:
                 new_order.append(apps_by_id[c.app_id])
-        if len(new_order) != len(self.config.applications):
+        if len(new_order) != len(env.applications):
             return
-        if [a.id for a in new_order] == [a.id for a in self.config.applications]:
+        if [a.id for a in new_order] == [a.id for a in env.applications]:
             return
-        self.config.applications = new_order
+        env.applications = new_order
         save_config(self.config)
 
     _STATE_ORDER = {STATUS_RUNNING: 0, STATUS_STARTING: 1, STATUS_STOPPED: 2}
 
-    def _sorted_services(self, app: Application):
+    def _sorted_services(self, env, app: Application):
         """Ordena: rodando -> iniciando -> parado; alfabetico em empate."""
         def key(s):
-            return (self._STATE_ORDER[self._service_state(s.id)], s.name)
+            return (self._STATE_ORDER[self._service_state(_skey(env.id, s.id))], s.name)
         return sorted(app.services, key=key)
 
-    def _build_card(self, app: Application) -> _AppCard:
+    def _build_card(self, env, app: Application) -> _AppCard:
         # Carrega imagem opcional pra usar como background do card.
         bg_pixmap = None
         if getattr(app, "icon_path", "") and Path(app.icon_path).exists():
@@ -1414,18 +1599,18 @@ class MainWindow(QWidget):
         if show_bulk:
             start_all = _icon_button(ICON_PLAY_ALL, "Iniciar tudo", role="start")
             stop_all = _icon_button(ICON_STOP_ALL, "Parar tudo", role="stop")
-            start_all.clicked.connect(lambda _, a=app: self._start_all(a))
-            stop_all.clicked.connect(lambda _, a=app: self._stop_all(a))
+            start_all.clicked.connect(lambda _, e=env, a=app: self._start_all(e, a))
+            stop_all.clicked.connect(lambda _, e=env, a=app: self._stop_all(e, a))
             header.addWidget(start_all)
             header.addWidget(stop_all)
-            self._start_all_btns[app.id] = start_all
-            self._stop_all_btns[app.id] = stop_all
-            self._apps_by_id[app.id] = app
+            self._start_all_btns[_skey(env.id, app.id)] = start_all
+            self._stop_all_btns[_skey(env.id, app.id)] = stop_all
+            self._apps_by_id[_skey(env.id, app.id)] = (env, app)
 
         edit_app = _icon_button(ICON_EDIT, "Editar aplicacao")
         del_app = _icon_button(ICON_DELETE, "Remover aplicacao", role="danger")
-        edit_app.clicked.connect(lambda _, a=app: self._edit_application(a))
-        del_app.clicked.connect(lambda _, a=app: self._delete_application(a))
+        edit_app.clicked.connect(lambda _, e=env, a=app: self._edit_application(e, a))
+        del_app.clicked.connect(lambda _, e=env, a=app: self._delete_application(e, a))
         header.addWidget(edit_app)
         header.addWidget(del_app)
         layout.addLayout(header)
@@ -1458,14 +1643,14 @@ class MainWindow(QWidget):
         svc_layout.setContentsMargins(0, 0, 0, 0)
         svc_layout.setSpacing(4)
         svc_layout.setAlignment(Qt.AlignTop)
-        for svc in self._sorted_services(app):
-            svc_layout.addWidget(self._build_service_row(svc))
+        for svc in self._sorted_services(env, app):
+            svc_layout.addWidget(self._build_service_row(env, svc))
         svc_scroll.setWidget(svc_content)
         layout.addWidget(svc_scroll, 1)  # stretch=1 ocupa espaco restante
 
         return card
 
-    def _build_service_row(self, svc) -> QWidget:
+    def _build_service_row(self, env, svc) -> QWidget:
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(2, 2, 2, 2)
@@ -1474,7 +1659,8 @@ class MainWindow(QWidget):
         dot = QLabel("●")
         dot.setStyleSheet(_dot_style(STATUS_STOPPED))
         dot.setToolTip(_DOT_LABEL[STATUS_STOPPED])
-        self._dots[svc.id] = dot
+        key = _skey(env.id, svc.id)
+        self._dots[key] = dot
         h.addWidget(dot)
 
         name = QLabel(svc.name)
@@ -1484,7 +1670,7 @@ class MainWindow(QWidget):
         # texto em vez de empurrar os botoes pra fora do card quando o nome
         # eh longo (o nome completo continua no tooltip).
         name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self._names[svc.id] = name
+        self._names[key] = name
         h.addWidget(name, 1)  # nome ocupa o espaco flexivel
 
         if getattr(svc, "is_prod", False):
@@ -1499,38 +1685,79 @@ class MainWindow(QWidget):
         if getattr(svc, "is_prod", False):
             # Servico de producao: so monitorado por URL. So mostra "Abrir".
             if svc.url:
-                open_btn = _icon_button(ICON_OPEN, f"Abrir {svc.url}")
-                open_btn.clicked.connect(
-                    lambda _, u=svc.url: QDesktopServices.openUrl(QUrl(u))
-                )
-                h.addWidget(open_btn)
+                h.addWidget(self._open_url_button(env, svc))
             return row
 
         # Servico local: botoes de controle (todos como icones).
         start = _icon_button(ICON_PLAY, "Iniciar", role="start")
         stop = _icon_button(ICON_STOP, "Parar", role="stop")
         restart = _icon_button(ICON_RESTART, "Reiniciar", role="restart")
-        start.clicked.connect(lambda _, s=svc: self._start(s))
-        stop.clicked.connect(lambda _, s=svc: self._stop(s))
-        restart.clicked.connect(lambda _, s=svc: self._restart(s))
+
+        if not supports_service(env, svc):
+            # runtime="windows" num ambiente ssh: subiria numa sessao Windows
+            # sem desktop. Mostra desabilitado em vez de fingir que funciona.
+            why = (
+                f"So sobe na maquina de {env.name} — um app Windows iniciado "
+                "por ssh cairia numa sessao sem desktop"
+            )
+            for b in (start, stop, restart):
+                b.setEnabled(False)
+                b.setToolTip(why)
+            self._start_btns[key] = start
+            self._stop_btns[key] = stop
+            self._restart_btns[key] = restart
+            stop.setVisible(False)
+            restart.setVisible(False)
+            h.addWidget(start)
+            h.addWidget(stop)
+            h.addWidget(restart)
+            return row
+
+        start.clicked.connect(lambda _, e=env, s=svc: self._start(e, s))
+        stop.clicked.connect(lambda _, e=env, s=svc: self._stop(e, s))
+        restart.clicked.connect(lambda _, e=env, s=svc: self._restart(e, s))
         # Start so aparece quando STOPPED; Stop/Reiniciar quando STARTING ou RUNNING.
         stop.setVisible(False)
         restart.setVisible(False)
-        self._start_btns[svc.id] = start
-        self._stop_btns[svc.id] = stop
-        self._restart_btns[svc.id] = restart
+        self._start_btns[key] = start
+        self._stop_btns[key] = stop
+        self._restart_btns[key] = restart
         h.addWidget(start)
         h.addWidget(stop)
         h.addWidget(restart)
 
         if svc.url:
-            open_btn = _icon_button(ICON_OPEN, f"Abrir {svc.url}")
-            open_btn.clicked.connect(
-                lambda _, u=svc.url: QDesktopServices.openUrl(QUrl(u))
-            )
-            h.addWidget(open_btn)
+            h.addWidget(self._open_url_button(env, svc))
 
         return row
+
+    @staticmethod
+    def _resolved_url(env, url: str) -> str:
+        """URL como ela deve ser aberta no navegador **desta** maquina.
+
+        Num ambiente ssh, `localhost:5001` eh o localhost de la. Se o ambiente
+        define url_host, troca o host por ele (ex.: 192.168.0.3, o IP de LAN).
+        """
+        host = (getattr(env, "url_host", "") or "").strip()
+        if not host or not url:
+            return url
+        try:
+            u = urlparse(url)
+            if (u.hostname or "") not in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+                return url
+            netloc = f"{host}:{u.port}" if u.port else host
+            return urlunparse(u._replace(netloc=netloc))
+        except Exception:
+            return url
+
+    def _open_url_button(self, env, svc) -> QPushButton:
+        target = self._resolved_url(env, svc.url)
+        tip = f"Abrir {target}"
+        if target != svc.url:
+            tip += f"\n(reescrito de {svc.url} — {env.name} eh remoto)"
+        btn = _icon_button(ICON_OPEN, tip)
+        btn.clicked.connect(lambda _, u=target: QDesktopServices.openUrl(QUrl(u)))
+        return btn
 
     def _open_logs(self) -> None:
         """Alterna o painel lateral com os logs de todos os servicos."""
@@ -1578,18 +1805,19 @@ class MainWindow(QWidget):
     # closeEvent esta definido mais acima junto com a logica da tray.
 
     # ----- acoes de processo --------------------------------------------
-    def _start(self, svc) -> None:
-        self.manager.start(svc)
-        self._starting[svc.id] = time.monotonic()
+    def _start(self, env, svc) -> None:
+        self.manager.start(env, svc)
+        self._starting[_skey(env.id, svc.id)] = time.monotonic()
         self._apply_status()
 
-    def _stop(self, svc) -> None:
-        self.manager.stop(svc)
-        self._running.discard(svc.id)
-        self._starting.pop(svc.id, None)
+    def _stop(self, env, svc) -> None:
+        self.manager.stop(env, svc)
+        key = _skey(env.id, svc.id)
+        self._running.discard(key)
+        self._starting.pop(key, None)
         self._apply_status()
 
-    def _restart(self, svc) -> None:
+    def _restart(self, env, svc) -> None:
         """Para e inicia o servico em seguida.
 
         A parada usa a mesma logica do botao "Parar": roda o `stop_command`
@@ -1597,64 +1825,117 @@ class MainWindow(QWidget):
         comando que o start disparou. Como o stop eh sincrono, quando ele
         retorna o processo antigo ja morreu e o start pode subir limpo.
         """
-        self._stop(svc)
-        self._start(svc)
+        self._stop(env, svc)
+        self._start(env, svc)
 
-    def _start_all(self, app: Application) -> None:
+    def _start_all(self, env, app: Application) -> None:
         for svc in app.services:
-            if getattr(svc, "is_prod", False):
+            if getattr(svc, "is_prod", False) or not supports_service(env, svc):
                 continue
-            self._start(svc)
+            self._start(env, svc)
 
-    def _stop_all(self, app: Application) -> None:
+    def _stop_all(self, env, app: Application) -> None:
         for svc in app.services:
-            if getattr(svc, "is_prod", False):
+            if getattr(svc, "is_prod", False) or not supports_service(env, svc):
                 continue
-            self._stop(svc)
+            self._stop(env, svc)
 
     # ----- status (polling nao-bloqueante via QProcess) -----------------
     def _poll_status(self) -> None:
-        if self._status_proc is not None:
-            return  # ainda processando o tick anterior
-        argv = wsl_argv(self.config.distro)
-        proc = QProcess(self)
-        proc.finished.connect(lambda *_: self._on_status_done(proc))
-        proc.errorOccurred.connect(lambda *_: self._on_status_done(proc))
-        self._status_proc = proc
-        proc.start(argv[0], argv[1:])
-        # Script vai via stdin embalado em base64 (ver wsl_stdin_payload).
-        proc.waitForStarted(2000)
-        proc.write(wsl_stdin_payload(build_status_script()).encode("utf-8"))
-        proc.closeWriteChannel()
+        """Dispara um poll por ambiente; cada um responde no seu tempo."""
+        for env in self.config.environments:
+            if self._status_procs.get(env.id) is not None:
+                continue  # ambiente ainda processando o tick anterior
+            proc = QProcess(self)
+            proc.finished.connect(
+                lambda *_, p=proc, e=env: self._on_status_done(p, e)
+            )
+            proc.errorOccurred.connect(
+                lambda *_, p=proc, e=env: self._on_status_done(p, e)
+            )
+            self._status_procs[env.id] = proc
+            argv = env_argv(env)
+            proc.start(argv[0], argv[1:])
+            # Script vai via stdin embalado em base64 (ver wsl_stdin_payload).
+            proc.waitForStarted(2000)
+            proc.write(env_payload(env, self._status_script_for(env)).encode("utf-8"))
+            proc.closeWriteChannel()
 
-    def _on_status_done(self, proc: QProcess) -> None:
-        if self._status_proc is not proc:
+    def _status_script_for(self, env) -> str:
+        """Script de status do ambiente.
+
+        No ambiente local os probes de URL/health continuam saindo do Windows
+        em thread separada (cobrem tambem servicos runtime="windows"). Num
+        ambiente ssh eles viajam dentro do proprio script: `localhost` de la
+        nao eh o daqui, e assim tudo cabe numa unica ida de rede.
+        """
+        if not env.is_ssh:
+            return build_status_script()
+        probes = []
+        health = []
+        for app in env.applications:
+            for svc in app.services:
+                hp = url_host_port(svc.url)
+                if hp:
+                    probes.append((svc.id, hp[0], hp[1]))
+                cmd = (getattr(svc, "health_command", "") or "").strip()
+                if cmd and not getattr(svc, "is_prod", False):
+                    health.append((svc.id, svc.directory, env.shell_init, cmd))
+        return build_status_script(probes=probes, health=health)
+
+    def _on_status_done(self, proc: QProcess, env) -> None:
+        if self._status_procs.get(env.id) is not proc:
             return
-        out = bytes(proc.readAllStandardOutput()).decode("utf-8", "replace")
-        wsl_alive = {line.strip() for line in out.splitlines() if line.strip()}
-        # Junta com PIDs Windows nativos (servicos com runtime="windows").
+        # Zera antes de ler: `finished` e `errorOccurred` podem disparar os
+        # dois pro mesmo processo, e a segunda passagem tem que sair aqui.
+        self._status_procs[env.id] = None
         try:
-            win_alive = running_ids_windows()
-        except Exception:
-            win_alive = set()
-        self._running_by_pid = wsl_alive | win_alive
-        self._status_proc = None
+            out = bytes(proc.readAllStandardOutput()).decode("utf-8", "replace")
+            # QProcess(self) fica pendurado no parent pra sempre se ninguem
+            # pedir a destruicao — um processo vazado por poll, a cada 2.5s.
+            proc.deleteLater()
+        except RuntimeError:
+            # Objeto C++ ja destruido (acontece no encerramento do app).
+            return
+        pid_alive, extra_alive = set(), set()
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("PID "):
+                pid_alive.add(line[4:].strip())
+            elif line.startswith(("URL ", "HEALTH ")):
+                extra_alive.add(line.split(None, 1)[1].strip())
+        if not env.is_ssh:
+            # Junta com PIDs Windows nativos (servicos com runtime="windows").
+            try:
+                pid_alive |= running_ids_windows()
+            except Exception:
+                pass
+        self._running_by_pid_env[env.id] = {_skey(env.id, i) for i in pid_alive}
+        self._running_by_url_env[env.id] = {_skey(env.id, i) for i in extra_alive}
+        self._status_procs[env.id] = None
         self._dispatch_url_probes()
         self._recompute_running_and_apply()
 
     def _dispatch_url_probes(self) -> None:
+        """Probes do ambiente **local**, feitos do lado do Windows.
+
+        Ambientes ssh nao passam por aqui — os deles vao no status script.
+        """
         if self._probe_in_flight:
             return
+        local_envs = [e for e in self.config.environments if not e.is_ssh]
         url_targets = [
-            (svc.id, svc.url)
-            for app in self.config.applications
+            (svc.id, svc.url, env)
+            for env in local_envs
+            for app in env.applications
             for svc in app.services
             if svc.url
         ]
         # health_command targets: precisa do service inteiro pra ter dir/runtime
         health_targets = [
-            svc
-            for app in self.config.applications
+            (svc, env)
+            for env in local_envs
+            for app in env.applications
             for svc in app.services
             if getattr(svc, "health_command", "").strip() and not getattr(svc, "is_prod", False)
         ]
@@ -1664,20 +1945,20 @@ class MainWindow(QWidget):
         self._probe_in_flight = True
         threading.Thread(
             target=self._run_probes,
-            args=(url_targets, health_targets, self.config.distro, self.config.shell_init),
+            args=(url_targets, health_targets),
             daemon=True,
         ).start()
 
-    def _run_probes(self, url_targets, health_targets, distro, shell_init) -> None:
+    def _run_probes(self, url_targets, health_targets) -> None:
         alive: set[str] = set()
         try:
             futs = {}
-            for sid, url in url_targets:
+            for sid, url, env in url_targets:
                 f = self._probe_pool.submit(probe_url, url, 0.3)
-                futs[f] = sid
-            for svc in health_targets:
-                f = self._probe_pool.submit(probe_health_command, svc, distro, shell_init, 2.0)
-                futs[f] = svc.id
+                futs[f] = _skey(env.id, sid)
+            for svc, env in health_targets:
+                f = self._probe_pool.submit(probe_health_command, svc, env, 2.0)
+                futs[f] = _skey(env.id, svc.id)
             for fut in as_completed(futs, timeout=3.0):
                 try:
                     if fut.result():
@@ -1689,7 +1970,7 @@ class MainWindow(QWidget):
         self._probe_bridge.result_ready.emit(alive)
 
     def _on_url_probe_done(self, alive: object) -> None:
-        self._running_by_url = set(alive) if alive else set()
+        self._running_by_url_local = set(alive) if alive else set()
         self._probe_in_flight = False
         self._recompute_running_and_apply()
 
@@ -1698,7 +1979,11 @@ class MainWindow(QWidget):
         old_state_by_sid = {
             sid: self._service_state(sid) for sid in self._dots
         }
-        self._running = self._running_by_pid | self._running_by_url
+        self._running = set(self._running_by_url_local)
+        for ids in self._running_by_pid_env.values():
+            self._running |= ids
+        for ids in self._running_by_url_env.values():
+            self._running |= ids
         for sid in list(self._starting):
             if sid in self._running:
                 self._starting.pop(sid, None)
@@ -1737,16 +2022,16 @@ class MainWindow(QWidget):
                     restart_btn.setVisible(not is_stopped)
 
         # Botoes "Iniciar tudo" / "Parar tudo" so quando faz sentido.
-        for app_id, app in self._apps_by_id.items():
+        for app_key, (env, app) in self._apps_by_id.items():
             states = [
-                self._service_state(s.id)
+                self._service_state(_skey(env.id, s.id))
                 for s in app.services
-                if not getattr(s, "is_prod", False)
+                if not getattr(s, "is_prod", False) and supports_service(env, s)
             ]
             any_stopped = any(s == STATUS_STOPPED for s in states)
             any_active = any(s != STATUS_STOPPED for s in states)
-            sa = self._start_all_btns.get(app_id)
-            so = self._stop_all_btns.get(app_id)
+            sa = self._start_all_btns.get(app_key)
+            so = self._stop_all_btns.get(app_key)
             if sa is not None:
                 sa.setVisible(any_stopped)
             if so is not None:
@@ -1760,24 +2045,27 @@ class MainWindow(QWidget):
         self._refresh_log_panel()
 
     def _add_application(self) -> None:
+        env = self._current_env()
+        if env is None:
+            return
         dlg = ApplicationDialog(self)
         if dlg.exec() == QDialog.Accepted:
-            self.config.applications.append(dlg.result_application())
+            env.applications.append(dlg.result_application())
             self._save_and_rebuild()
 
-    def _edit_application(self, app: Application) -> None:
+    def _edit_application(self, env, app: Application) -> None:
         dlg = ApplicationDialog(self, app)
         if dlg.exec() == QDialog.Accepted:
-            idx = self.config.applications.index(app)
-            self.config.applications[idx] = dlg.result_application()
+            idx = env.applications.index(app)
+            env.applications[idx] = dlg.result_application()
             self._save_and_rebuild()
 
-    def _delete_application(self, app: Application) -> None:
+    def _delete_application(self, env, app: Application) -> None:
         resp = QMessageBox.question(
-            self, "Remover", f"Remover a aplicacao \"{app.name}\"?"
+            self, "Remover", f"Remover a aplicacao \"{app.name}\" de \"{env.name}\"?"
         )
         if resp == QMessageBox.Yes:
-            self.config.applications.remove(app)
+            env.applications.remove(app)
             self._save_and_rebuild()
 
     def _reload(self) -> None:
@@ -1789,8 +2077,7 @@ class MainWindow(QWidget):
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self, self.config, on_update_requested=self._open_update)
         if dlg.exec() == QDialog.Accepted:
-            self.config.distro = dlg.distro_edit.text().strip()
-            self.config.shell_init = dlg.init_edit.text().strip()
+            # O dialogo edita self.config.environments in-place.
             self._save_and_rebuild()
 
     def _open_config_file(self) -> None:

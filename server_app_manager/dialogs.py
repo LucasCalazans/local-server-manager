@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 import re
 
-from .config import Application, Service
+from .config import Application, Environment, Service
 
 
 def _next_dup_name(name: str) -> str:
@@ -32,6 +32,113 @@ def _next_dup_name(name: str) -> str:
     if m:
         return f"{m.group(1)}{m.group(2)}{int(m.group(3)) + 1}"
     return f"{name.rstrip()} 2"
+
+
+class EnvironmentDialog(QDialog):
+    """Edita a maquina de um ambiente (aba). Nao mexe nas aplicacoes dele."""
+
+    def __init__(self, parent=None, env: Environment | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Ambiente")
+        self.setMinimumWidth(520)
+        self._env = env
+
+        self.name_edit = QLineEdit(env.name if env else "")
+        self.name_edit.setPlaceholderText("Ex.: Este Computador, prism-server")
+
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItem("Esta maquina (WSL local)", "local")
+        self.kind_combo.addItem("Remota via ssh", "ssh")
+        cur = env.kind if env else "local"
+        self.kind_combo.setCurrentIndex(1 if cur == "ssh" else 0)
+        self.kind_combo.currentIndexChanged.connect(self._update_visibility)
+
+        self.host_edit = QLineEdit(env.ssh_host if env else "")
+        self.host_edit.setPlaceholderText("Alias ou user@host do ssh — ex.: prism-server")
+        self.distro_edit = QLineEdit(env.distro if env else "")
+        self.distro_edit.setPlaceholderText("Ex.: Ubuntu (vazio = distro padrao)")
+        self.init_edit = QLineEdit(env.shell_init if env else "")
+        self.init_edit.setPlaceholderText(
+            'export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+        )
+        self.url_host_edit = QLineEdit(env.url_host if env else "")
+        self.url_host_edit.setPlaceholderText("Ex.: 192.168.0.3 (vazio = abre a URL como esta)")
+
+        form = QFormLayout()
+        form.addRow("Nome:", self.name_edit)
+        form.addRow("Onde roda:", self.kind_combo)
+        self._host_row = self.host_edit
+        form.addRow("Host ssh:", self.host_edit)
+        form.addRow("Distro WSL:", self.distro_edit)
+        form.addRow("Shell init:", self.init_edit)
+        form.addRow("Host das URLs:", self.url_host_edit)
+        self._form = form
+
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color: #8b949e;")
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+        layout.addLayout(form)
+        layout.addWidget(self.hint)
+        layout.addStretch()
+        layout.addWidget(buttons)
+
+        self._update_visibility()
+
+    def _update_visibility(self) -> None:
+        is_ssh = self.kind_combo.currentData() == "ssh"
+        self.host_edit.setEnabled(is_ssh)
+        self.url_host_edit.setEnabled(is_ssh)
+        if is_ssh:
+            self.hint.setText(
+                "Os comandos saem pelo WSL desta maquina e entram por ssh no host "
+                "— eh o WSL que tem o ~/.ssh/config e a rota da tailnet, nao o "
+                "Windows. A chave precisa funcionar sem senha (BatchMode).\n\n"
+                "\"Distro WSL\" aqui eh a distro local de onde o ssh sai. "
+                "\"Host das URLs\" substitui localhost ao abrir no navegador, ja "
+                "que o localhost de la nao eh o daqui.\n\n"
+                "Servicos com runtime=\"windows\" nao sobem por ssh: eles cairiam "
+                "numa sessao Windows sem desktop."
+            )
+        else:
+            self.hint.setText(
+                "Os comandos rodam no WSL desta maquina — o comportamento "
+                "padrao. \"Shell init\" eh prependido a cada comando, util "
+                "quando o npm vem do nvm e o ~/.bashrc nao carrega em shell "
+                "nao-interativo."
+            )
+
+    def _on_accept(self) -> None:
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Nome vazio", "Informe um nome para o ambiente.")
+            return
+        if self.kind_combo.currentData() == "ssh" and not self.host_edit.text().strip():
+            QMessageBox.warning(
+                self, "Host vazio",
+                "Um ambiente remoto precisa do host/alias do ssh.",
+            )
+            return
+        self.accept()
+
+    def result_environment(self) -> Environment:
+        env = Environment(
+            name=self.name_edit.text().strip(),
+            kind=self.kind_combo.currentData(),
+            ssh_host=self.host_edit.text().strip(),
+            distro=self.distro_edit.text().strip(),
+            shell_init=self.init_edit.text().strip(),
+            url_host=self.url_host_edit.text().strip(),
+        )
+        if self._env is not None:
+            env.id = self._env.id
+        return env
 
 
 class ServiceDialog(QDialog):

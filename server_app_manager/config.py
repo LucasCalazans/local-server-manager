@@ -102,24 +102,51 @@ class Application:
 
 
 @dataclass
-class Config:
-    # Nome da distro WSL (ex.: "Ubuntu"). Vazio = distro padrão do wsl.exe.
+class Environment:
+    """Uma maquina onde os servicos rodam — vira uma aba na interface.
+
+    kind="local": os comandos vao pro WSL desta maquina (comportamento
+    historico, e o unico que existia antes das abas).
+
+    kind="ssh": os comandos saem pelo WSL **local** e entram por `ssh` no
+    host remoto. O WSL eh o tunel de proposito: o app roda no Windows, que
+    nao conhece os aliases do `~/.ssh/config` do WSL nem alcanca a faixa
+    100.x da tailnet (o NordLynx ocupa a mesma CGNAT). Rodar o ssh de
+    dentro do WSL reaproveita a config, as chaves e a rota que ja funcionam
+    la.
+    """
+
+    name: str
+    kind: str = "local"
+    # Host/alias do ssh (ex.: "prism-server"), so para kind="ssh".
+    ssh_host: str = ""
+    # Distro WSL: onde os comandos rodam (local) ou de onde o ssh sai (ssh).
+    # Vazio = distro padrao do wsl.exe.
     distro: str = ""
     # Trecho de shell prependido a cada comando, util para carregar nvm/venv
     # quando o ~/.bashrc nao roda em shell nao-interativo. Ex.:
     #   "export NVM_DIR=$HOME/.nvm; . $NVM_DIR/nvm.sh"
     shell_init: str = ""
-    # Caminho ate o source do projeto (pasta com main.py). Usado pelo botao
-    # "Atualizar" pra rebuildar o EXE. Pode ser caminho Windows ou UNC do WSL.
-    source_dir: str = ""
+    # Host que substitui "localhost" ao abrir as URLs dos servicos deste
+    # ambiente no navegador (ex.: "192.168.0.3"). Vazio = abre como esta.
+    url_host: str = ""
     applications: list[Application] = field(default_factory=list)
+    id: str = field(default_factory=new_id)
+
+    @property
+    def is_ssh(self) -> bool:
+        return self.kind == "ssh"
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Config":
+    def from_dict(cls, data: dict) -> "Environment":
         return cls(
+            id=data.get("id") or new_id(),
+            name=data.get("name", ""),
+            kind=data.get("kind", "local") or "local",
+            ssh_host=data.get("ssh_host", ""),
             distro=data.get("distro", ""),
             shell_init=data.get("shell_init", ""),
-            source_dir=data.get("source_dir", ""),
+            url_host=data.get("url_host", ""),
             applications=[
                 Application.from_dict(a) for a in data.get("applications", [])
             ],
@@ -127,11 +154,65 @@ class Config:
 
     def to_dict(self) -> dict:
         return {
+            "id": self.id,
+            "name": self.name,
+            "kind": self.kind,
+            "ssh_host": self.ssh_host,
             "distro": self.distro,
             "shell_init": self.shell_init,
-            "source_dir": self.source_dir,
+            "url_host": self.url_host,
             "applications": [a.to_dict() for a in self.applications],
         }
+
+
+DEFAULT_ENV_NAME = "Este Computador"
+
+
+@dataclass
+class Config:
+    # Caminho ate o source do projeto (pasta com main.py). Usado pelo botao
+    # "Atualizar" pra rebuildar o EXE. Pode ser caminho Windows ou UNC do WSL.
+    source_dir: str = ""
+    environments: list[Environment] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Config":
+        envs = data.get("environments")
+        if envs is None:
+            # Config no formato antigo (lista plana de applications, com
+            # distro/shell_init globais): vira um unico ambiente local.
+            envs = [
+                {
+                    "name": DEFAULT_ENV_NAME,
+                    "kind": "local",
+                    "distro": data.get("distro", ""),
+                    "shell_init": data.get("shell_init", ""),
+                    "applications": data.get("applications", []),
+                }
+            ]
+        cfg = cls(
+            source_dir=data.get("source_dir", ""),
+            environments=[Environment.from_dict(e) for e in envs],
+        )
+        if not cfg.environments:
+            cfg.environments = [Environment(name=DEFAULT_ENV_NAME)]
+        return cfg
+
+    def to_dict(self) -> dict:
+        return {
+            "source_dir": self.source_dir,
+            "environments": [e.to_dict() for e in self.environments],
+        }
+
+    def env_by_id(self, env_id: str) -> "Environment | None":
+        return next((e for e in self.environments if e.id == env_id), None)
+
+    def env_of_service(self, service_id: str) -> "Environment | None":
+        for env in self.environments:
+            for app in env.applications:
+                if any(s.id == service_id for s in app.services):
+                    return env
+        return None
 
 
 def load_config(path: Path = CONFIG_PATH) -> Config:
