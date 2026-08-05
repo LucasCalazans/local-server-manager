@@ -179,6 +179,15 @@ QPushButton[role="stop"]:hover {{
     background: rgba(248, 81, 73, 0.20);
     border-color: {RED};
 }}
+QPushButton[role="restart"] {{
+    background: rgba(210, 153, 34, 0.12);
+    border-color: rgba(210, 153, 34, 0.35);
+    color: {YELLOW};
+}}
+QPushButton[role="restart"]:hover {{
+    background: rgba(210, 153, 34, 0.20);
+    border-color: {YELLOW};
+}}
 QPushButton[role="primary"] {{
     background: {ACCENT};
     border-color: {ACCENT};
@@ -269,6 +278,7 @@ def _set_role(btn: QPushButton, role: str) -> None:
 # Nomes de icones (FontAwesome 5 Solid via QtAwesome).
 ICON_PLAY = "fa5s.play"
 ICON_STOP = "fa5s.stop"
+ICON_RESTART = "fa5s.sync-alt"
 ICON_PLAY_ALL = "fa5s.forward"
 ICON_STOP_ALL = "fa5s.times-circle"
 ICON_OPEN = "fa5s.external-link-alt"
@@ -280,6 +290,7 @@ ICON_DELETE = "fa5s.trash"
 _ICON_COLOR_BY_ROLE = {
     "start": GREEN,
     "stop": RED,
+    "restart": YELLOW,
     "danger": RED,
     "primary": "white",
 }
@@ -972,6 +983,7 @@ class MainWindow(QWidget):
         self._names: dict[str, QLabel] = {}
         self._start_btns: dict[str, QPushButton] = {}
         self._stop_btns: dict[str, QPushButton] = {}
+        self._restart_btns: dict[str, QPushButton] = {}
         # app.id -> botoes "iniciar tudo" / "parar tudo" (toggle por estado)
         self._start_all_btns: dict[str, QPushButton] = {}
         self._stop_all_btns: dict[str, QPushButton] = {}
@@ -1145,6 +1157,7 @@ class MainWindow(QWidget):
         self._names.clear()
         self._start_btns.clear()
         self._stop_btns.clear()
+        self._restart_btns.clear()
         self._start_all_btns.clear()
         self._stop_all_btns.clear()
         self._apps_by_id.clear()
@@ -1295,6 +1308,10 @@ class MainWindow(QWidget):
         name = QLabel(svc.name)
         name.setStyleSheet("font-weight: 500;")
         name.setToolTip(svc.name)  # nome completo no hover
+        # Ignored no horizontal: o label pode encolher abaixo da largura do
+        # texto em vez de empurrar os botoes pra fora do card quando o nome
+        # eh longo (o nome completo continua no tooltip).
+        name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._names[svc.id] = name
         h.addWidget(name, 1)  # nome ocupa o espaco flexivel
 
@@ -1320,14 +1337,19 @@ class MainWindow(QWidget):
         # Servico local: botoes de controle (todos como icones).
         start = _icon_button(ICON_PLAY, "Iniciar", role="start")
         stop = _icon_button(ICON_STOP, "Parar", role="stop")
+        restart = _icon_button(ICON_RESTART, "Reiniciar", role="restart")
         start.clicked.connect(lambda _, s=svc: self._start(s))
         stop.clicked.connect(lambda _, s=svc: self._stop(s))
-        # Start so aparece quando STOPPED; Stop quando STARTING ou RUNNING.
+        restart.clicked.connect(lambda _, s=svc: self._restart(s))
+        # Start so aparece quando STOPPED; Stop/Reiniciar quando STARTING ou RUNNING.
         stop.setVisible(False)
+        restart.setVisible(False)
         self._start_btns[svc.id] = start
         self._stop_btns[svc.id] = stop
+        self._restart_btns[svc.id] = restart
         h.addWidget(start)
         h.addWidget(stop)
+        h.addWidget(restart)
 
         if svc.url:
             open_btn = _icon_button(ICON_OPEN, f"Abrir {svc.url}")
@@ -1395,6 +1417,17 @@ class MainWindow(QWidget):
         self._running.discard(svc.id)
         self._starting.pop(svc.id, None)
         self._apply_status()
+
+    def _restart(self, svc) -> None:
+        """Para e inicia o servico em seguida.
+
+        A parada usa a mesma logica do botao "Parar": roda o `stop_command`
+        quando ele existe e, de qualquer forma, mata o process group do
+        comando que o start disparou. Como o stop eh sincrono, quando ele
+        retorna o processo antigo ja morreu e o start pode subir limpo.
+        """
+        self._stop(svc)
+        self._start(svc)
 
     def _start_all(self, app: Application) -> None:
         for svc in app.services:
@@ -1524,10 +1557,13 @@ class MainWindow(QWidget):
             dot.setToolTip(_DOT_LABEL[state])
             start_btn = self._start_btns.get(sid)
             stop_btn = self._stop_btns.get(sid)
+            restart_btn = self._restart_btns.get(sid)
             if start_btn is not None and stop_btn is not None:
                 is_stopped = state == STATUS_STOPPED
                 start_btn.setVisible(is_stopped)
                 stop_btn.setVisible(not is_stopped)
+                if restart_btn is not None:
+                    restart_btn.setVisible(not is_stopped)
 
         # Botoes "Iniciar tudo" / "Parar tudo" so quando faz sentido.
         for app_id, app in self._apps_by_id.items():

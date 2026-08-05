@@ -8,8 +8,8 @@ precisar abrir o terminal e digitar os comandos de cada projeto.
 
 - Lista suas aplicacoes em cards; cada aplicacao tem um ou mais **servicos**
   (ex.: Backend e Frontend).
-- Botoes por servico: **Iniciar**, **Parar** e **Abrir** (abre a URL no
-  navegador do Windows).
+- Botoes por servico: **Iniciar**, **Parar**, **Reiniciar** (para e sobe de
+  novo) e **Abrir** (abre a URL no navegador do Windows).
 - Indicador de **status** (verde = rodando, cinza = parado), atualizado
   automaticamente — inclusive depois de reabrir o painel.
 - Cadastro pela propria interface (botao **+ Aplicacao**) **ou** editando o
