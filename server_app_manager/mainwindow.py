@@ -250,6 +250,22 @@ QScrollBar::handle:vertical:hover {{
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0;
 }}
+QScrollBar:horizontal {{
+    background: {BG_APP};
+    height: 10px;
+    margin: 0;
+}}
+QScrollBar::handle:horizontal {{
+    background: {BORDER};
+    border-radius: 5px;
+    min-width: 24px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: {GREY};
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    width: 0;
+}}
 """
 
 STATUS_STOPPED = "stopped"
@@ -478,6 +494,33 @@ _LOG_LABEL_COLORS = [
 _LABEL_WIDTH = 36
 
 
+class _LogView(QPlainTextEdit):
+    """View de log com shift+roda rolando na horizontal.
+
+    Sem isso o shift+roda cai no QAbstractSlider, que interpreta o modificador
+    como "rola uma pagina inteira" — ou seja, um pulo vertical enorme, que eh
+    justamente o oposto do esperado num log de linha longa sem quebra.
+    """
+
+    def wheelEvent(self, event) -> None:
+        if not (event.modifiers() & Qt.ShiftModifier):
+            super().wheelEvent(event)
+            return
+        bar = self.horizontalScrollBar()
+        pixels = event.pixelDelta()
+        if not pixels.isNull():
+            # Touchpad/roda de precisao: ja vem em pixels, anda 1:1.
+            delta = pixels.y() or pixels.x()
+        else:
+            angle = event.angleDelta()
+            # Um giro (120) anda 1/6 da largura visivel: percorre uma linha
+            # longa em poucos giros sem perder a referencia do texto.
+            step = max(bar.pageStep() // 6, 24)
+            delta = (angle.y() or angle.x()) / 120.0 * step
+        bar.setValue(bar.value() - round(delta))
+        event.accept()
+
+
 class UnifiedLogPanel(QFrame):
     """Painel lateral com os logs de todos os servicos, prefixados pela origem.
 
@@ -500,7 +543,7 @@ class UnifiedLogPanel(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
         self._on_close = on_close
 
-        self.view = QPlainTextEdit()
+        self.view = _LogView()
         self.view.setObjectName("logView")
         self.view.setReadOnly(True)
         self.view.setMaximumBlockCount(self.MAX_BLOCKS)
@@ -703,17 +746,25 @@ class UnifiedLogPanel(QFrame):
         if not self._pending:
             return
         bar = self.view.verticalScrollBar()
+        hbar = self.view.horizontalScrollBar()
         # So gruda no fim se o usuario ja estava no fim — se ele rolou pra
         # cima pra ler algo, respeita a posicao dele.
         at_bottom = bar.value() >= bar.maximum() - 4
+        # Na horizontal a posicao eh sempre preservada: normalmente ela eh 0
+        # (inicio da mensagem visivel), e se o usuario rolou pra direita pra
+        # ler uma linha longa, ele fica onde estava em vez de ser arrastado.
+        hpos = hbar.value()
         self.view.setUpdatesEnabled(False)
         for html_line in self._pending:
             self.view.appendHtml(html_line)
         self._pending.clear()
         self.view.setUpdatesEnabled(True)
         if at_bottom:
-            self.view.moveCursor(QTextCursor.End)
+            # Sem moveCursor(End): mover o cursor faz o Qt garantir que ele
+            # esteja visivel e joga o scroll pro fim da ultima linha — o que
+            # deixava o log andando sozinho pra direita a cada linha longa.
             bar.setValue(bar.maximum())
+        hbar.setValue(hpos)
 
     def suspend(self) -> None:
         """Derruba os tails ao fechar o painel; reabrir recomeca do backlog."""
