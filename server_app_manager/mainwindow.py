@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+import json
 import os
 import tempfile
 import threading
@@ -28,7 +29,7 @@ import re
 from urllib.parse import urlparse, urlunparse
 
 import qtawesome as qta
-from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QProcess, QRect, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QMimeData, QObject, QPoint, QProcess, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -1377,6 +1378,7 @@ class MainWindow(QWidget):
         self._build_ui()
         self._setup_tray()
         self.rebuild()
+        self._setup_config_watcher()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_status)
@@ -2236,6 +2238,71 @@ class MainWindow(QWidget):
         if resp == QMessageBox.Yes:
             env.applications.remove(app)
             self._save_and_rebuild()
+
+    # ----- watcher da config (recarrega sem reiniciar) -------------------
+    def _setup_config_watcher(self) -> None:
+        """Recarrega a config sozinho quando o arquivo muda no disco.
+
+        Observa tambem o *diretorio*, nao so o arquivo: editor que salva por
+        replace (escreve num temporario e renomeia por cima) troca o inode, e
+        o QFileSystemWatcher larga o path em silencio. Sem o diretorio, a
+        primeira edicao externa seria tambem a ultima detectada.
+        """
+        self._config_watcher = QFileSystemWatcher(self)
+        self._rewatch_config()
+        self._config_watcher.fileChanged.connect(self._on_config_changed)
+        self._config_watcher.directoryChanged.connect(self._on_config_changed)
+        # Um unico save costuma emitir varios sinais (truncar, escrever,
+        # renomear). Sem coalescer, a UI se reconstruiria tres vezes seguidas.
+        self._config_reload_timer = QTimer(self)
+        self._config_reload_timer.setSingleShot(True)
+        self._config_reload_timer.setInterval(300)
+        self._config_reload_timer.timeout.connect(self._reload_if_changed)
+
+    def _rewatch_config(self) -> None:
+        """(Re)inscreve arquivo e diretorio — addPath ignora o que ja esta la."""
+        w = self._config_watcher
+        ja_observados = set(w.files()) | set(w.directories())
+        for path in (str(CONFIG_PATH), str(CONFIG_PATH.parent)):
+            if path not in ja_observados:
+                w.addPath(path)
+
+    def _on_config_changed(self, _path: str) -> None:
+        self._rewatch_config()
+        self._config_reload_timer.start()
+
+    @staticmethod
+    def _config_snapshot(data: dict) -> str:
+        """Forma canonica pra comparar config em disco com a da memoria."""
+        return json.dumps(data, sort_keys=True, ensure_ascii=False)
+
+    def _reload_if_changed(self) -> None:
+        """So recarrega se o disco realmente divergir do que esta em memoria.
+
+        Todo save do proprio app (adicionar servico, editar ambiente) mexe no
+        arquivo e acorda o watcher. Sem essa comparacao, cada um desses saves
+        provocaria um reload redundante logo depois do rebuild que ele mesmo
+        acabou de fazer — piscando a UI a toa.
+        """
+        self._rewatch_config()
+        try:
+            with CONFIG_PATH.open("r", encoding="utf-8") as fh:
+                disco = json.load(fh)
+        except (OSError, ValueError):
+            # Leitura pegou uma escrita pela metade: o proximo sinal do
+            # watcher (ou o rename final) tenta de novo.
+            return
+        if self._config_snapshot(disco) == self._config_snapshot(self.config.to_dict()):
+            return
+        # Com dialogo aberto o reload seria destrutivo: o dialogo guarda a
+        # referencia do Environment/Application que estava sendo editado, e o
+        # reload troca todos por instancias novas. O que o usuario confirmasse
+        # depois cairia num objeto orfao e sumiria no proximo save. Adia ate
+        # ele fechar.
+        if QApplication.activeModalWidget() is not None:
+            self._config_reload_timer.start()
+            return
+        self._reload()
 
     def _reload(self) -> None:
         self.config = load_config()
