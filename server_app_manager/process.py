@@ -123,9 +123,14 @@ def wsl_stdin_payload(script: str, keep_file: bool = False) -> str:
     Codifica em base64 e gera um one-liner que decodifica num tmpfile e
     executa via `bash -l`. Sem `\n` (o bash do WSL ignora stdin com newlines)
     e sem expor `$VAR` que possa ser expandido pelo wsl.exe.
+
+    A limpeza do tmpfile guarda e devolve o `$?` do script. Sem isso o exit
+    status da linha inteira seria o do `rm` — ou seja, 0 sempre —, e quem
+    decide por codigo de saida (probe_health_command) leria todo servico como
+    vivo.
     """
     b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
-    cleanup = "" if keep_file else '; rm -f "$F"'
+    cleanup = "" if keep_file else '; rc=$?; rm -f "$F"; exit $rc'
     return (
         'F=$(mktemp /tmp/appmgr-XXXXXX.sh); '
         f'echo {b64} | base64 -d > "$F"; '

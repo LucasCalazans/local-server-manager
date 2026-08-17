@@ -18,16 +18,19 @@ app roda. Se aparecerem la, foi engano — apagar.
 
 ## Como rebuildar
 
-Sincronizar os arquivos alterados pro D e compilar la (build nativo, disco
-Windows):
+Sincronizar os arquivos alterados pro D, compilar num `--distpath` novo e
+espelhar por cima do definitivo:
 
 ```bash
-cp server_app_manager/mainwindow.py /mnt/d/build/local-server-manager/server_app_manager/
-cd /mnt/d/build/local-server-manager && python.exe -m PyInstaller --noconfirm --windowed --collect-data qtawesome --hidden-import PySide6.QtNetwork --name "ServerAppManager" main.py
+cp server_app_manager/process.py /mnt/d/build/local-server-manager/server_app_manager/
+cd /mnt/d/build/local-server-manager && python.exe -m PyInstaller --noconfirm --windowed --collect-data qtawesome --hidden-import PySide6.QtNetwork --name "ServerAppManager" --distpath "D:\build\local-server-manager\dist-new" main.py
+powershell.exe -NoProfile -Command "robocopy 'D:\build\local-server-manager\dist-new\ServerAppManager' 'D:\build\local-server-manager\dist\ServerAppManager' /MIR /NFL /NDL /NJH /NP; exit 0"
+powershell.exe -NoProfile -Command "Remove-Item -LiteralPath 'D:\build\local-server-manager\dist-new' -Recurse -Force"
 ```
 
-Esse eh exatamente o comando do `build.bat`, menos os `pip install` do inicio: o
-Python do Windows (3.14) ja tem PySide6, QtAwesome e PyInstaller instalados.
+O `--distpath` nao eh capricho: ver armadilha 1. Fora isso o comando eh o do
+`build.bat`, menos os `pip install` do inicio — o Python do Windows (3.14) ja
+tem PySide6, QtAwesome e PyInstaller instalados.
 
 `cmd.exe /c build.bat` a partir do repo do WSL **nao** funciona — o `cmd` recusa
 caminho UNC (`\\wsl.localhost\...`) como diretorio de trabalho. Chamar o
@@ -39,21 +42,25 @@ Windows).
 
 ## Armadilhas ja encontradas
 
-1. **Janela do Explorer aberta em `dist\ServerAppManager` trava o build**
-   (`WinError 32`). Pior: o PyInstaller apaga o `dist` antigo **antes** de
-   falhar, entao o build que funcionava se perde. Fechar as janelas antes:
+1. **`D:\build\local-server-manager\dist\ServerAppManager` vive presa por
+   algum processo** (`WinError 32` ao tentar apagar/renomear). Ja aconteceu
+   duas vezes, a segunda **sem nenhuma janela do Explorer aberta** — fechar o
+   Explorer nao basta e o dono do handle segue nao identificado (uma pasta
+   irma, criada na hora, apaga numa boa).
 
-   ```bash
-   powershell.exe -NoProfile -Command "(New-Object -ComObject Shell.Application).Windows() | Where-Object { \$_.LocationURL -like '*local-server-manager*' } | ForEach-Object { \$_.Quit() }"
-   ```
+   O estrago: o PyInstaller apaga o `dist` **antes** de falhar, entao a
+   tentativa destroi o build que funcionava e nao entrega o novo. Por isso o
+   `--distpath` acima — buildar em pasta nova nunca esbarra no lock, e
+   `robocopy /MIR` escreve *dentro* da pasta presa, o que funciona mesmo
+   quando apagar a pasta nao funciona.
 
 2. **`mv`/`rm` de diretorio em `/mnt/d` dando "Permission denied" pelo WSL** quase
-   nunca eh permissao — eh handle aberto do lado Windows. Checar quem segura
-   antes de insistir.
+   nunca eh permissao — eh o mesmo `WinError 32` visto de outro angulo.
 
-3. **Quando nao da pra substituir a pasta**, escrever arquivos *dentro* dela
-   costuma funcionar mesmo assim. Buildar em outro lugar e espelhar:
+3. **`checking PYZ` sem `Building PYZ` no log = cache reusado.** Nem sempre eh
+   erro (se a analise anterior ja tinha o source novo, o cache esta correto),
+   mas nao confie: confira se o fix entrou mesmo no EXE.
 
    ```bash
-   powershell.exe -NoProfile -Command "robocopy '<origem>' 'D:\build\local-server-manager\dist\ServerAppManager' /E /NFL /NDL /NJH /NP"
+   python.exe -c "from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader; c=CArchiveReader(r'D:\build\local-server-manager\dist\ServerAppManager\ServerAppManager.exe'); n=[x for x in c.toc if x.endswith('.pyz')][0]; open(r'C:\Users\calaz\AppData\Local\Temp\pyz.tmp','wb').write(c.extract(n)); z=ZlibArchiveReader(r'C:\Users\calaz\AppData\Local\Temp\pyz.tmp'); print(z.extract('server_app_manager.process').co_consts[:3])"
    ```
