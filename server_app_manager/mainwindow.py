@@ -315,6 +315,7 @@ def _set_role(btn: QPushButton, role: str) -> None:
 ICON_PLAY = "fa5s.play"
 ICON_STOP = "fa5s.stop"
 ICON_RESTART = "fa5s.sync-alt"
+ICON_BUSY = "fa5s.circle-notch"  # spinner das acoes em andamento
 ICON_PLAY_ALL = "fa5s.forward"
 ICON_STOP_ALL = "fa5s.times-circle"
 ICON_OPEN = "fa5s.external-link-alt"
@@ -329,6 +330,20 @@ _ICON_COLOR_BY_ROLE = {
     "restart": YELLOW,
     "danger": RED,
     "primary": "white",
+}
+
+# Argumentos de _icon_button por acao. A mesma tabela cria o botao e o devolve
+# ao estado normal quando o spinner sai.
+_ACTION_BTN = {
+    "start": (ICON_PLAY, "Iniciar", "start"),
+    "stop": (ICON_STOP, "Parar", "stop"),
+    "restart": (ICON_RESTART, "Reiniciar", "restart"),
+}
+
+_BUSY_LABEL = {
+    "start": "Iniciando...",
+    "stop": "Parando...",
+    "restart": "Reiniciando...",
 }
 
 
@@ -775,6 +790,11 @@ class UnifiedLogPanel(QFrame):
 class _ProbeBridge(QObject):
     """Ponte para receber resultado dos probes URL em thread de fundo."""
     result_ready = Signal(object)  # set[str] com service_ids vivos
+
+
+class _ActionBridge(QObject):
+    """Ponte pra thread de acao avisar a UI thread que o script terminou."""
+    done = Signal(object)  # (skey, acao)
 
 
 class _BuildBridge(QObject):
@@ -1344,6 +1364,14 @@ class MainWindow(QWidget):
         self._probe_in_flight = False
         self._probe_bridge = _ProbeBridge()
         self._probe_bridge.result_ready.connect(self._on_url_probe_done)
+        # Acoes de play/stop/restart saem da UI thread: o stop espera o
+        # processo morrer (ate 60s) e congelava a janela inteira. Vao em
+        # thread daemon avulsa, nao em pool — o atexit do ThreadPoolExecutor
+        # seguraria a saida do app enquanto um stop longo nao voltasse.
+        self._busy: dict[str, str] = {}          # skey -> acao em voo
+        self._spinners: dict[str, object] = {}   # skey -> animacao do spinner
+        self._action_bridge = _ActionBridge()
+        self._action_bridge.done.connect(self._on_action_done)
         self._running_by_url_local: set[str] = set()
 
         self._build_ui()
@@ -1552,6 +1580,7 @@ class MainWindow(QWidget):
         self._start_btns.clear()
         self._stop_btns.clear()
         self._restart_btns.clear()
+        self._stop_spinners()
         self._start_all_btns.clear()
         self._stop_all_btns.clear()
         self._apps_by_id.clear()
@@ -1740,9 +1769,9 @@ class MainWindow(QWidget):
             return row
 
         # Servico local: botoes de controle (todos como icones).
-        start = _icon_button(ICON_PLAY, "Iniciar", role="start")
-        stop = _icon_button(ICON_STOP, "Parar", role="stop")
-        restart = _icon_button(ICON_RESTART, "Reiniciar", role="restart")
+        start = _icon_button(*_ACTION_BTN["start"])
+        stop = _icon_button(*_ACTION_BTN["stop"])
+        restart = _icon_button(*_ACTION_BTN["restart"])
 
         if not supports_service(env, svc):
             # runtime="windows" num ambiente ssh: subiria numa sessao Windows
@@ -1857,27 +1886,63 @@ class MainWindow(QWidget):
 
     # ----- acoes de processo --------------------------------------------
     def _start(self, env, svc) -> None:
-        self.manager.start(env, svc)
-        self._starting[_skey(env.id, svc.id)] = time.monotonic()
-        self._apply_status()
+        self._submit_action("start", env, svc)
 
     def _stop(self, env, svc) -> None:
-        self.manager.stop(env, svc)
-        key = _skey(env.id, svc.id)
-        self._running.discard(key)
-        self._starting.pop(key, None)
-        self._apply_status()
+        self._submit_action("stop", env, svc)
 
     def _restart(self, env, svc) -> None:
-        """Para e inicia o servico em seguida.
+        self._submit_action("restart", env, svc)
 
-        A parada usa a mesma logica do botao "Parar": roda o `stop_command`
-        quando ele existe e, de qualquer forma, mata o process group do
-        comando que o start disparou. Como o stop eh sincrono, quando ele
-        retorna o processo antigo ja morreu e o start pode subir limpo.
+    def _submit_action(self, action: str, env, svc) -> None:
+        """Dispara a acao numa thread e devolve o controle pra UI na hora.
+
+        Um servico so tem uma acao em voo por vez: clique repetido enquanto o
+        spinner gira eh ignorado, em vez de empilhar dois scripts brigando
+        pelo mesmo pidfile.
         """
-        self._stop(env, svc)
-        self._start(env, svc)
+        key = _skey(env.id, svc.id)
+        if key in self._busy:
+            return
+        self._busy[key] = action
+        if action != "stop":
+            # Bolinha ambar ja no clique: o comando foi disparado, mas subir
+            # leva tempo e o poll so confirma no proximo tick.
+            self._starting[key] = time.monotonic()
+        self._apply_status()
+        threading.Thread(
+            target=self._run_action, args=(action, env, svc, key), daemon=True
+        ).start()
+
+    def _run_action(self, action: str, env, svc, key: str) -> None:
+        """Roda fora da UI thread — nada aqui pode tocar em widget.
+
+        No restart o stop vem antes e eh sincrono: quando ele retorna, o
+        processo antigo ja morreu (roda o `stop_command` quando existe e, de
+        qualquer forma, mata o process group do comando que o start disparou),
+        entao o start sobe limpo.
+        """
+        try:
+            if action in ("stop", "restart"):
+                self.manager.stop(env, svc)
+            if action in ("start", "restart"):
+                self.manager.start(env, svc)
+        except Exception:
+            pass
+        self._action_bridge.done.emit((key, action))
+
+    def _on_action_done(self, payload: object) -> None:
+        key, action = payload
+        self._busy.pop(key, None)
+        if action == "stop":
+            self._running.discard(key)
+            self._starting.pop(key, None)
+        else:
+            # Os 45s de STARTING contam do fim do script, nao do clique: um
+            # restart demorado comeria a janela inteira antes de o servico
+            # ter chance de responder.
+            self._starting[key] = time.monotonic()
+        self._apply_status()
 
     def _start_all(self, env, app: Application) -> None:
         for svc in app.services:
@@ -2065,12 +2130,65 @@ class MainWindow(QWidget):
             start_btn = self._start_btns.get(sid)
             stop_btn = self._stop_btns.get(sid)
             restart_btn = self._restart_btns.get(sid)
-            if start_btn is not None and stop_btn is not None:
-                is_stopped = state == STATUS_STOPPED
-                start_btn.setVisible(is_stopped)
-                stop_btn.setVisible(not is_stopped)
-                if restart_btn is not None:
-                    restart_btn.setVisible(not is_stopped)
+            if start_btn is None or stop_btn is None:
+                continue
+            action = self._busy.get(sid)
+            if action is not None:
+                self._apply_busy(sid, action, start_btn, stop_btn, restart_btn)
+                continue
+            self._clear_busy(sid, start_btn, stop_btn, restart_btn)
+            is_stopped = state == STATUS_STOPPED
+            start_btn.setVisible(is_stopped)
+            stop_btn.setVisible(not is_stopped)
+            if restart_btn is not None:
+                restart_btn.setVisible(not is_stopped)
+
+    def _apply_busy(self, sid, action, start_btn, stop_btn, restart_btn) -> None:
+        """Deixa visivel so o botao da acao em voo, girando, e trava os tres."""
+        target = {"start": start_btn, "stop": stop_btn, "restart": restart_btn}[action]
+        for btn in (start_btn, stop_btn, restart_btn):
+            if btn is not None:
+                btn.setVisible(btn is target)
+                btn.setEnabled(False)
+        if target is None or sid in self._spinners:
+            return
+        anim = qta.Spin(target, interval=30, step=6)
+        self._spinners[sid] = anim
+        target.setIcon(
+            qta.icon(ICON_BUSY, color=_ICON_COLOR_BY_ROLE[action], animation=anim)
+        )
+        target.setToolTip(_BUSY_LABEL[action])
+
+    def _clear_busy(self, sid, start_btn, stop_btn, restart_btn) -> None:
+        """Devolve icone, tooltip e enabled — so pra quem estava girando.
+
+        A saida antecipada importa: servico sem suporte no ambiente (app
+        Windows num ambiente ssh) tem os botoes desabilitados de proposito, e
+        reabilitar aqui desfaria isso a cada tick do poll.
+        """
+        anim = self._spinners.pop(sid, None)
+        if anim is None:
+            return
+        anim.stop()
+        for btn, act in ((start_btn, "start"), (stop_btn, "stop"), (restart_btn, "restart")):
+            if btn is None:
+                continue
+            icon, tip, role = _ACTION_BTN[act]
+            btn.setIcon(qta.icon(icon, color=_ICON_COLOR_BY_ROLE[role]))
+            btn.setToolTip(tip)
+            btn.setEnabled(True)
+
+    def _stop_spinners(self) -> None:
+        """Para as animacoes antes de o rebuild destruir os botoes.
+
+        O timer do qta.Spin eh filho do botao e chama update() nele a cada
+        30ms; sem parar, cada rebuild deixaria um timer batendo em widget
+        morto. O _apply_status seguinte recria o spinner de quem ainda tiver
+        acao em voo.
+        """
+        for anim in self._spinners.values():
+            anim.stop()
+        self._spinners.clear()
 
         # Botoes "Iniciar tudo" / "Parar tudo" so quando faz sentido.
         for app_key, (env, app) in self._apps_by_id.items():
