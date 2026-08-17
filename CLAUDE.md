@@ -45,8 +45,20 @@ Windows).
 1. **`D:\build\local-server-manager\dist\ServerAppManager` vive presa por
    algum processo** (`WinError 32` ao tentar apagar/renomear). Ja aconteceu
    duas vezes, a segunda **sem nenhuma janela do Explorer aberta** — fechar o
-   Explorer nao basta e o dono do handle segue nao identificado (uma pasta
-   irma, criada na hora, apaga numa boa).
+   Explorer nao basta (uma pasta irma, criada na hora, apaga numa boa).
+
+   **Um dos donos do handle ja foi identificado: o proprio app rodando.**
+   O `ServerAppManager.exe` aberto segura o EXE que se quer sobrescrever.
+   O sintoma pelo robocopy nao eh erro, eh *travamento*: o default eh
+   `/R:1000000 /W:30`, entao ele reenta pra sempre em silencio — 8 minutos
+   com zero arquivos copiados e nenhuma mensagem. Fechar o app destrava e o
+   robocopy conclui sozinho. **Cheque o processo antes de espelhar:**
+
+   ```bash
+   powershell.exe -NoProfile -Command "Get-Process ServerAppManager -ErrorAction SilentlyContinue"
+   ```
+
+   E use `/R:2 /W:2` no robocopy pra ele falhar rapido em vez de pendurar.
 
    O estrago: o PyInstaller apaga o `dist` **antes** de falhar, entao a
    tentativa destroi o build que funcionava e nao entrega o novo. Por isso o
